@@ -1,0 +1,8 @@
+# 로컬 개발 프로필(./gradlew bootRun 과 docker compose 의 app 서비스가 켠다).
+# 운영 배포에는 이 프로필을 켜지 않는다.
+fms:
+  security:
+    jwt:
+      # 로컬 전용 서명 키. 운영은 FMS_JWT_SECRET 환경 변수로 별도 값을 넣는다.
+      secret: ${FMS_JWT_SECRET:local-dev-only-secret-change-me-0123456789}
+      dev-token-enabled: true

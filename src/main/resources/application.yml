@@ -1,0 +1,154 @@
+spring:
+  application:
+    name: mini-fms-backend
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      compression-type: lz4
+      properties:
+        # 재시도로 인한 중복·순서 뒤바뀜을 브로커가 막는다(파티션 단위).
+        enable.idempotence: true
+        linger.ms: 5
+        max.block.ms: 10000
+        request.timeout.ms: 10000
+        delivery.timeout.ms: 30000
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      max-poll-records: 500
+    listener:
+      ack-mode: batch
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  # ClickHouse(HTTP 8123) — 과거 궤적 저장소
+  datasource:
+    url: jdbc:clickhouse://${CLICKHOUSE_HOST:localhost}:${CLICKHOUSE_PORT:8123}/${CLICKHOUSE_DB:fms}
+    username: ${CLICKHOUSE_USER:fms}
+    password: ${CLICKHOUSE_PASSWORD:fms_local}
+    driver-class-name: com.clickhouse.jdbc.ClickHouseDriver
+    hikari:
+      pool-name: clickhouse
+      maximum-pool-size: 4
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:clickhouse/schema.sql
+
+  task:
+    scheduling:
+      pool:
+        size: 4
+      thread-name-prefix: fms-sched-
+
+  mvc:
+    problemdetails:
+      enabled: true
+  jackson:
+    default-property-inclusion: non_null
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+
+fms:
+  topics:
+    telematics-raw: telematics-raw-events
+    telematics-dlt: telematics-raw-events.DLT
+    geofence-alerts: vehicle-geofence-alerts
+    commands: vehicle-commands
+    command-acks: vehicle-command-acks
+    command-compensations: vehicle-command-compensations
+    incident-alerts: c-its-incident-alerts
+    partitions: 6
+    replication-factor: 1
+
+  consumers:
+    realtime-concurrency: 3
+    history-concurrency: 3
+
+  telematics:
+    max-future-skew: 5m
+    publish-timeout: 3s
+
+  idempotency:
+    window: 10m
+    lease: 15s
+
+  location:
+    active-threshold: 60s
+    stale-after: 10m
+    eviction-interval: 1m
+    latest-ttl: 7d
+
+  geofence:
+    fences:
+      - id: SEOUL-DC
+        name: 서울 물류센터
+        latitude: 37.5665
+        longitude: 126.9780
+        radius-meters: 1000
+        hysteresis-meters: 30
+
+  command:
+    ack-timeout: 5s
+    timeout-scan-interval: 500ms
+    transmit-timeout: 3s
+    lock-grace: 10s
+    record-retention: 24h
+
+  incident:
+    alert-radius-km: 2.0
+    alert-ttl: 10m
+
+  outbox:
+    relay-interval: 200ms
+    batch-size: 200
+
+  security:
+    jwt:
+      # 32바이트 이상. 비어 있으면 기동하지 않는다(로컬은 local 프로필이 개발용 값을 넣는다).
+      secret: ${FMS_JWT_SECRET:}
+      issuer: mini-fms
+      dev-token-enabled: false
+
+  simulator:
+    telemetry:
+      enabled: ${FMS_SIMULATOR_ENABLED:true}
+      vehicle-count: 10
+      interval: 1s
+      duplicate-rate: 0.05
+      speed-multiplier: 5
+      depot-latitude: 37.5665
+      depot-longitude: 126.9780
+    responder:
+      enabled: ${FMS_SIMULATOR_ENABLED:true}
+      min-delay: 300ms
+      max-delay: 1500ms
+      # 타임아웃·거절 시연용 차량
+      unresponsive-vehicles: [V-010]
+      rejecting-vehicles: [V-009]
+
+logging:
+  level:
+    com.minifms: INFO
+    org.apache.kafka: WARN

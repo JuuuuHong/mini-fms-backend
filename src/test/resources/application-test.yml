@@ -1,0 +1,33 @@
+fms:
+  security:
+    jwt:
+      # 테스트 전용 서명 키
+      secret: test-only-secret-0123456789-abcdefghijklmnop
+      dev-token-enabled: false
+
+  simulator:
+    telemetry:
+      enabled: false
+    responder:
+      enabled: true
+      min-delay: 100ms
+      max-delay: 300ms
+      unresponsive-vehicles: [T-NORESP-1, T-NORESP-2]
+      rejecting-vehicles: [T-REJECT]
+
+  command:
+    ack-timeout: 2s
+    timeout-scan-interval: 200ms
+
+  outbox:
+    relay-interval: 100ms
+
+  # 다른 테스트의 차량과 겹치지 않도록 부산 좌표에 둔다.
+  geofence:
+    fences:
+      - id: TEST-DC
+        name: 테스트 물류센터
+        latitude: 35.1796
+        longitude: 129.0756
+        radius-meters: 1000
+        hysteresis-meters: 30
