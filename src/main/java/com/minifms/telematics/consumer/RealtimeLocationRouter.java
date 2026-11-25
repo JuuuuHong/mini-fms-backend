@@ -6,6 +6,7 @@ import com.minifms.common.idempotency.IdempotencyGuard;
 import com.minifms.common.metrics.FmsMetrics;
 import com.minifms.geofence.GeofenceDetector;
 import com.minifms.telematics.domain.TelematicsEvent;
+import com.minifms.vehicle.location.LocationUpdate;
 import com.minifms.vehicle.location.VehicleLocationRepository;
 import java.time.Clock;
 import java.util.ArrayList;
@@ -107,10 +108,11 @@ public class RealtimeLocationRouter {
         metrics.processed(SINK, completed.size());
     }
 
+    /** 최신 위치와 지오펜스 전이를 한 원자 연산으로 반영한다(둘 사이에서 실패해 알림이 빠지는 일이 없다). */
     private void route(TelematicsEvent event) {
-        boolean advanced = locationRepository.updateIfNewer(event, clock.millis());
-        if (advanced) {
-            geofenceDetector.evaluate(event);
+        LocationUpdate update = locationRepository.applyIfNewer(event, clock.millis(), geofenceDetector.candidates(event));
+        if (update.applied()) {
+            geofenceDetector.recordTransitions(update.transitions());
         } else {
             // 더 최신 위치가 이미 반영돼 있다(지연 도착). 최신 위치·지오펜스 상태를 과거로 되돌리지 않는다.
             metrics.outOfOrder();

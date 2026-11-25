@@ -2,6 +2,7 @@ package com.minifms.vehicle.location;
 
 import com.minifms.common.config.properties.LocationProperties;
 import com.minifms.common.redis.RedisKeys;
+import com.minifms.geofence.GeofenceCandidate;
 import com.minifms.telematics.domain.TelematicsEvent;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -30,13 +31,15 @@ import org.springframework.stereotype.Repository;
  *   <li>fms:vehicles:last-seen — 마지막 수신 시각. 활성 판정·오래된 차량 정리에 쓴다.</li>
  * </ul>
  * 쓰기는 opsForGeo().add 대신 Lua 로 한다. "저장된 것보다 최신일 때만 GEOADD" 를 원자적으로 해야
- * 지연 도착한 과거 좌표가 최신 위치를 덮어쓰지 않기 때문이다.
+ * 지연 도착한 과거 좌표가 최신 위치를 덮어쓰지 않고, 지오펜스 전이도 같은 연산 안에서 반영해야
+ * 위치만 저장된 채 알림이 빠지는 일이 없기 때문이다.
  */
 @Repository
 public class VehicleLocationRepository {
 
-    private static final RedisScript<Long> UPDATE_IF_NEWER =
-            RedisScript.of(new ClassPathResource("scripts/location_update.lua"), Long.class);
+    @SuppressWarnings("rawtypes")
+    private static final RedisScript<List> UPDATE_IF_NEWER =
+            RedisScript.of(new ClassPathResource("scripts/location_update.lua"), List.class);
     private static final RedisScript<Long> EVICT_STALE =
             RedisScript.of(new ClassPathResource("scripts/evict_stale.lua"), Long.class);
 
@@ -48,20 +51,54 @@ public class VehicleLocationRepository {
         this.properties = properties;
     }
 
-    /** 더 최신 이벤트일 때만 위치를 반영한다. 반영했으면 true. */
+    /** 더 최신 이벤트일 때만 위치를 반영한다(지오펜스 판정 없음). 반영했으면 true. */
     public boolean updateIfNewer(TelematicsEvent event, long ingestedAtMillis) {
-        Long applied = redis.execute(UPDATE_IF_NEWER,
-                List.of(RedisKeys.VEHICLE_GEO, RedisKeys.vehicleLatest(event.vehicleId()), RedisKeys.VEHICLE_LAST_SEEN),
-                event.vehicleId(),
-                Double.toString(event.longitude()),
-                Double.toString(event.latitude()),
-                Long.toString(event.timestamp()),
-                Double.toString(event.speed()),
-                Double.toString(event.batterySoc()),
-                event.engineStatus().name(),
-                Long.toString(ingestedAtMillis),
-                Long.toString(properties.latestTtl().toSeconds()));
-        return applied != null && applied == 1L;
+        return applyIfNewer(event, ingestedAtMillis, List.of()).applied();
+    }
+
+    /**
+     * 더 최신 이벤트일 때만 위치를 반영하고, 같은 원자 연산 안에서 지오펜스 전이 후보를 적용한다.
+     * 이전 상태와 다른 후보만 실제 전이가 되며 그 알림은 아웃박스에 들어간다.
+     *
+     * <p>응답을 받기 전에 실패해도(연결 끊김 등) 재전달 때 결과가 같다: 스크립트가 실행됐다면 위치와 지오펜스가
+     * 함께 반영돼 있어 다시 실행해도 아무것도 바뀌지 않고, 실행되지 않았다면 이번에 함께 반영된다.
+     */
+    public LocationUpdate applyIfNewer(TelematicsEvent event, long ingestedAtMillis, List<GeofenceCandidate> candidates) {
+        List<String> keys = new ArrayList<>(4 + candidates.size());
+        keys.add(RedisKeys.VEHICLE_GEO);
+        keys.add(RedisKeys.vehicleLatest(event.vehicleId()));
+        keys.add(RedisKeys.VEHICLE_LAST_SEEN);
+        keys.add(RedisKeys.OUTBOX);
+        List<String> args = new ArrayList<>(9 + candidates.size() * 2);
+        args.add(event.vehicleId());
+        args.add(Double.toString(event.longitude()));
+        args.add(Double.toString(event.latitude()));
+        args.add(Long.toString(event.timestamp()));
+        args.add(Double.toString(event.speed()));
+        args.add(Double.toString(event.batterySoc()));
+        args.add(event.engineStatus().name());
+        args.add(Long.toString(ingestedAtMillis));
+        args.add(Long.toString(properties.latestTtl().toSeconds()));
+        for (GeofenceCandidate candidate : candidates) {
+            keys.add(RedisKeys.geofenceInside(candidate.geofenceId()));
+            args.add(candidate.transition().name());
+            args.add(candidate.outboxEntry());
+        }
+
+        List<?> result = redis.execute(UPDATE_IF_NEWER, keys, args.toArray());
+        if (result == null || result.isEmpty()) {
+            throw new IllegalStateException("위치 갱신 결과가 비어 있습니다");
+        }
+        if (((Number) result.get(0)).longValue() != 1L) {
+            return LocationUpdate.IGNORED;
+        }
+        List<GeofenceCandidate> transitions = new ArrayList<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            if (((Number) result.get(i + 1)).longValue() == 1L) {
+                transitions.add(candidates.get(i));
+            }
+        }
+        return new LocationUpdate(true, transitions);
     }
 
     /**
