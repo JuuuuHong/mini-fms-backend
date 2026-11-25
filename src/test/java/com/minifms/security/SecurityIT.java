@@ -6,6 +6,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.minifms.support.IntegrationTestSupport;
+import com.minifms.support.TestEvents;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -54,6 +55,45 @@ class SecurityIT extends IntegrationTestSupport {
         mockMvc.perform(post("/api/v1/vehicles/NO-SUCH-VEHICLE/commands").header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON).content("{\"type\":\"DOOR_LOCK\"}"))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void 수집과_돌발상황_보고는_전용_scope_토큰만_할_수_있다() throws Exception {
+        long now = System.currentTimeMillis();
+        String telemetry = """
+                {"vehicleId":"SEC-1","latitude":37.5,"longitude":127.0,"speed":10,
+                 "batterySoc":50,"engineStatus":"ON","timestamp":%d}""".formatted(now);
+        String incident = """
+                {"incidentId":"%s","type":"ACCIDENT","latitude":37.5,"longitude":127.0,
+                 "sourceId":"RSU-1","occurredAt":%d}""".formatted(TestEvents.uniqueId("SEC-INC"), now);
+        String readOnly = issuer.issue("viewer", List.of(Scopes.FLEET_READ), Duration.ofMinutes(5)).accessToken();
+        String controlOnly = issuer.issue("operator", List.of(Scopes.VEHICLE_CONTROL), Duration.ofMinutes(5)).accessToken();
+
+        List<String[]> writes = List.of(
+                new String[] {"/api/v1/telematics", telemetry},
+                new String[] {"/api/v1/telematics/batch", "{\"events\":[" + telemetry + "]}"},
+                new String[] {"/api/v1/incidents", incident});
+        for (String[] write : writes) {
+            // 토큰 없음 → 401
+            mockMvc.perform(post(write[0]).contentType(MediaType.APPLICATION_JSON).content(write[1]))
+                    .andExpect(status().isUnauthorized());
+            // 다른 scope(조회·제어) 토큰 → 403
+            for (String token : List.of(readOnly, controlOnly)) {
+                mockMvc.perform(post(write[0]).header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                                .contentType(MediaType.APPLICATION_JSON).content(write[1]))
+                        .andExpect(status().isForbidden());
+            }
+        }
+
+        // 전용 scope 를 가진 토큰만 통과한다.
+        String device = issuer.issue("gateway-1", List.of(Scopes.TELEMATICS_WRITE), Duration.ofMinutes(5)).accessToken();
+        mockMvc.perform(post("/api/v1/telematics").header(HttpHeaders.AUTHORIZATION, "Bearer " + device)
+                        .contentType(MediaType.APPLICATION_JSON).content(telemetry))
+                .andExpect(status().isAccepted());
+        String rsu = issuer.issue("rsu-1", List.of(Scopes.INCIDENT_WRITE), Duration.ofMinutes(5)).accessToken();
+        mockMvc.perform(post("/api/v1/incidents").header(HttpHeaders.AUTHORIZATION, "Bearer " + rsu)
+                        .contentType(MediaType.APPLICATION_JSON).content(incident))
+                .andExpect(status().isAccepted());
     }
 
     @Test
