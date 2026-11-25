@@ -30,6 +30,11 @@ import org.springframework.stereotype.Repository;
  * <p>쓰기는 external 버전으로 한다(문서 ID = incidentId, 버전 = 처리 결과 version). Elasticsearch 는 저장된 것보다
  * 큰 버전만 받아들이므로(409 version_conflict), 같은 결과의 재전달은 문서를 늘리지 않고, 늦게 도착한 이전 결과는
  * 최신 결과를 덮어쓰지 않는다. 소비자 쪽 순서 보장이나 별도 잠금이 필요 없다.
+ *
+ * <p>색인은 별칭(c-its-incidents) → 실제 색인(c-its-incidents-v1, strict 매핑)으로 둔다. 쓰기는 require_alias 로 해서
+ * 별칭이 없으면(색인 삭제·클러스터 재생성) Elasticsearch 가 동적 매핑으로 색인을 자동 생성하지 않고 실패하게 한다.
+ * 그러면 준비 표시를 지우고 다시 시도할 때 매핑을 지정해 새로 만든다. 별칭은 나중에 매핑을 바꿀 때 재색인 후
+ * 별칭만 옮기는 데에도 쓴다.
  */
 @Repository
 public class IncidentHistoryRepository {
@@ -43,15 +48,23 @@ public class IncidentHistoryRepository {
         this.properties = properties;
     }
 
-    /** 색인이 없으면 매핑을 지정해 만든다. 앱 기동 때가 아니라 첫 색인 때 하므로 Elasticsearch 가 꺼진 채로도 앱은 뜬다. */
+    /** 별칭이 없으면 매핑을 지정한 실제 색인과 별칭을 만든다. 첫 색인 때 하므로 Elasticsearch 가 꺼진 채로도 앱은 뜬다. */
     public void ensureIndex() throws IOException {
         if (indexReady.get()) {
             return;
         }
-        if (!client.indices().exists(e -> e.index(properties.index())).value()) {
+        String alias = properties.index();
+        String concrete = concreteIndex();
+        if (!client.indices().existsAlias(a -> a.name(alias)).value()) {
+            if (client.indices().exists(e -> e.index(alias)).value()) {
+                // 별칭 자리에 동적 매핑으로 만들어진 색인이 있다. 매핑을 보장할 수 없으므로 쓰지 않는다(재색인 필요).
+                throw new IllegalStateException("'" + alias + "' 가 별칭이 아니라 색인으로 있습니다. "
+                        + concrete + " 로 재색인한 뒤 별칭으로 바꿔야 합니다");
+            }
             try {
                 client.indices().create(c -> c
-                        .index(properties.index())
+                        .index(concrete)
+                        .aliases(alias, a -> a.isWriteIndex(true))
                         .mappings(m -> m
                                 .dynamic(DynamicMapping.Strict)
                                 .properties("incidentId", p -> p.keyword(k -> k))
@@ -68,17 +81,24 @@ public class IncidentHistoryRepository {
                                 .properties("processedAt", p -> p.date(d -> d))));
             } catch (ElasticsearchException e) {
                 if (!"resource_already_exists_exception".equals(errorType(e))) {
-                    throw e; // 다른 인스턴스가 먼저 만든 경우만 괜찮다
+                    throw e;
                 }
+                // 다른 인스턴스가 먼저 만들었거나, 실제 색인은 있는데 별칭만 빠진 경우
+                client.indices().putAlias(p -> p.index(concrete).name(alias).isWriteIndex(true));
             }
         }
         indexReady.set(true);
     }
 
+    private String concreteIndex() {
+        return properties.index() + "-v1";
+    }
+
     /** 처리 결과를 한 번의 bulk 요청으로 색인한다. */
     public BulkOutcome indexAll(Collection<IncidentProcessingResult> results) throws IOException {
         ensureIndex();
-        BulkRequest.Builder bulk = new BulkRequest.Builder();
+        // 별칭으로만 쓴다. 별칭이 사라졌으면 동적 매핑으로 자동 생성하지 않고 404 로 실패한다.
+        BulkRequest.Builder bulk = new BulkRequest.Builder().requireAlias(true);
         for (IncidentProcessingResult result : results) {
             bulk.operations(op -> op.index(index -> index
                     .index(properties.index())
@@ -98,6 +118,10 @@ public class IncidentHistoryRepository {
                 indexed++;
             } else if (item.status() == 409) {
                 stale++; // 같은 버전(재전달) 또는 더 최신 버전이 이미 있음(늦은 도착)
+            } else if (item.status() == 404) {
+                // 별칭이 없다(색인 삭제·클러스터 재생성). 다음 시도에서 매핑을 지정해 다시 만든다.
+                indexReady.set(false);
+                retryable.add(item.id() + ": " + item.error().type());
             } else if (item.status() == 429 || item.status() >= 500) {
                 retryable.add(item.id() + ": " + item.error().type());
             } else {

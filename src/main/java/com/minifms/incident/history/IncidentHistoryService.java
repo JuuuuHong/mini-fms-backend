@@ -39,7 +39,7 @@ public class IncidentHistoryService {
         if (size > properties.maxPageSize()) {
             violations.add("size 는 최대 " + properties.maxPageSize() + "입니다");
         }
-        if ((long) (page + 1) * size > MAX_RESULT_WINDOW) {
+        if (((long) page + 1) * size > MAX_RESULT_WINDOW) {
             violations.add("page·size 로 " + MAX_RESULT_WINDOW + "번째 이후는 조회할 수 없습니다. 기간을 좁히세요");
         }
         if (!violations.isEmpty()) {
@@ -58,11 +58,20 @@ public class IncidentHistoryService {
                 .orElseThrow(() -> new NotFoundException("돌발상황 이력이 없습니다(아직 색인 전일 수 있습니다): " + incidentId));
     }
 
+    /**
+     * 연결 실패·시간 초과·과부하(429)·서버 오류(5xx)만 "잠시 뒤 다시"(503)로 본다.
+     * 그 밖의 Elasticsearch 거절(4xx)은 다시 해도 같으므로 서버 오류(500)로 드러낸다.
+     */
     private static <T> T call(SearchCall<T> call) {
         try {
             return call.run();
-        } catch (IOException | UncheckedIOException | ElasticsearchException e) {
+        } catch (IOException | UncheckedIOException e) {
             throw new HistoryUnavailableException("관제 이력 저장소에 연결할 수 없습니다. 잠시 뒤 다시 시도하세요.", e);
+        } catch (ElasticsearchException e) {
+            if (e.status() == 429 || e.status() >= 500) {
+                throw new HistoryUnavailableException("관제 이력 저장소가 일시적으로 요청을 처리하지 못합니다. 잠시 뒤 다시 시도하세요.", e);
+            }
+            throw new IllegalStateException("관제 이력 검색 요청이 거절됐습니다: " + e.getMessage(), e);
         }
     }
 

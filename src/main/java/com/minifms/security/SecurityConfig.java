@@ -3,6 +3,8 @@ package com.minifms.security;
 import static com.minifms.security.Scopes.authority;
 
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import java.time.Instant;
+import java.util.Objects;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -11,7 +13,10 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.JwtClaimNames;
+import org.springframework.security.oauth2.jwt.JwtClaimValidator;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.security.oauth2.jwt.JwtValidators;
@@ -59,13 +64,18 @@ public class SecurityConfig {
         return http.build();
     }
 
-    /** HS256 서명 검증 + exp/nbf(기본 60초 시계 오차 허용) + iss 검증. */
+    /**
+     * HS256 서명 검증 + exp/nbf(기본 60초 시계 오차 허용) + iss 검증 + exp 필수.
+     * 기본 검증기는 exp 가 없으면 통과시키므로(영구 토큰), exp 가 있어야 한다는 검증을 더한다.
+     */
     @Bean
     public JwtDecoder jwtDecoder(JwtProperties properties) {
         NimbusJwtDecoder decoder = NimbusJwtDecoder.withSecretKey(properties.secretKey())
                 .macAlgorithm(MacAlgorithm.HS256)
                 .build();
-        decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(properties.issuer()));
+        decoder.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+                JwtValidators.createDefaultWithIssuer(properties.issuer()),
+                new JwtClaimValidator<Instant>(JwtClaimNames.EXP, Objects::nonNull)));
         return decoder;
     }
 

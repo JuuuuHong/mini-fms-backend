@@ -84,16 +84,17 @@ public class IncidentBroadcastService {
 
         try {
             long activeSince = clock.millis() - locationProperties.activeThreshold().toMillis();
+            // 시동 꺼짐을 먼저 거른 뒤 상한을 적용한다(거르기 전에 자르면 주행 차량이 대상에서 빠질 수 있다).
             List<NearbyVehicle> recipients = locationRepository.searchNearby(
-                            report.latitude(), report.longitude(), properties.alertRadiusKm(),
-                            activeSince, properties.maxRecipients())
-                    .stream()
-                    .filter(vehicle -> vehicle.engineStatus() != EngineStatus.OFF)
-                    .toList();
+                    report.latitude(), report.longitude(), properties.alertRadiusKm(),
+                    activeSince, properties.maxRecipients(), vehicle -> vehicle.engineStatus() != EngineStatus.OFF);
 
             Dispatch dispatch = dispatch(report, recipients);
-            IncidentProcessingResult result = resultRecorder.record(
-                    report, recipients.size(), dispatch.confirmed(), dispatch.failed());
+            IncidentProcessingResult result = resultRecorder
+                    .record(claim, report, recipients.size(), dispatch.confirmed(), dispatch.failed())
+                    .orElseThrow(() -> new ConflictException(
+                            "처리 시간이 길어 선점이 만료됐고 같은 돌발상황을 다른 처리가 이어받았습니다. 이 처리의 결과는 남기지 않습니다",
+                            Map.of("incidentId", report.incidentId())));
             List<String> vehicleIds = recipients.stream().map(NearbyVehicle::vehicleId).toList();
             log.info("돌발상황 전파 incidentId={} type={} 반경 {}km 대상 {}대 확인 {}건 상태 {} version={}",
                     report.incidentId(), report.type(), properties.alertRadiusKm(), recipients.size(),
@@ -114,21 +115,35 @@ public class IncidentBroadcastService {
         }
     }
 
-    /** 경고를 모두 보낸 뒤, 하나의 마감 안에서 건별로 브로커 확인을 기다려 센다. */
+    /**
+     * 경고를 보내고, 하나의 마감(publishTimeout) 안에서 건별로 브로커 확인을 기다려 센다.
+     * <ul>
+     *   <li>마감은 보내기 전에 잡는다. 보내는 동안 마감이 지나면 남은 차량은 보내지 않고 실패로 센다.</li>
+     *   <li>send 가 브로커 장애로 즉시 실패하면(메타데이터를 max.block.ms 안에 얻지 못함 등, 재시도 가능한 오류) 남은 차량도
+     *       같은 이유로 실패하므로 더 보내지 않는다. 브로커 장애 때 차량마다 max.block.ms 씩 요청 스레드가 묶이는 것을 막는다.
+     *       레코드 한 건만의 거절(재시도해도 같은 오류)은 다른 차량과 무관하므로 계속 보낸다.</li>
+     * </ul>
+     * 그래서 confirmedCount 는 "마감 안에 브로커가 수신을 확인한 수"다.
+     */
     private Dispatch dispatch(IncidentReport report, List<NearbyVehicle> recipients) {
         Instant issuedAt = Instant.now(clock);
+        long deadline = System.nanoTime() + properties.publishTimeout().toNanos();
         List<CompletableFuture<?>> sends = new ArrayList<>(recipients.size());
+        Throwable firstError = null;
         for (NearbyVehicle vehicle : recipients) {
-            try {
-                sends.add(publisher.publish(topics.incidentAlerts(), vehicle.vehicleId(), toAlert(report, vehicle, issuedAt)));
-            } catch (RuntimeException e) {
-                sends.add(CompletableFuture.failedFuture(e)); // send 자체가 실패(메타데이터 조회 시간 초과 등)
+            if (System.nanoTime() >= deadline) {
+                firstError = new TimeoutException("발행 마감(" + properties.publishTimeout() + ") 안에 모든 경고를 보내지 못했습니다");
+                break;
+            }
+            CompletableFuture<?> send = publisher.publish(topics.incidentAlerts(), vehicle.vehicleId(),
+                    toAlert(report, vehicle, issuedAt));
+            sends.add(send);
+            if (send.isCompletedExceptionally() && KafkaEventPublisher.isRetriable(send.exceptionNow())) {
+                break;
             }
         }
 
-        long deadline = System.nanoTime() + properties.publishTimeout().toNanos();
         int confirmed = 0;
-        Throwable firstError = null;
         for (CompletableFuture<?> send : sends) {
             try {
                 send.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);

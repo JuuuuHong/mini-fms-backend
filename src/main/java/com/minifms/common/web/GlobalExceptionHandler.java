@@ -4,6 +4,9 @@ import com.minifms.common.kafka.EventPublishException;
 import com.minifms.incident.history.HistoryUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
@@ -52,6 +55,23 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .header(HttpHeaders.RETRY_AFTER, "5")
                 .body(ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage()));
+    }
+
+    /** Redis·ClickHouse 연결 실패·시간 초과는 잠시 뒤 다시 시도하면 되는 오류다(503). */
+    @ExceptionHandler({DataAccessResourceFailureException.class, TransientDataAccessException.class})
+    public ResponseEntity<ProblemDetail> handleStoreUnavailable(DataAccessException e) {
+        log.warn("저장소 일시 장애: {}", e.toString());
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "5")
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                        "저장소에 일시적으로 연결할 수 없습니다. 잠시 뒤 다시 시도하세요."));
+    }
+
+    /** 처리하지 못한 예외도 같은 형식(Problem Details)으로 돌려준다. 내부 메시지는 응답에 싣지 않는다. */
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ProblemDetail> handleUnexpected(Exception e) {
+        log.error("처리하지 못한 예외", e);
+        return problem(HttpStatus.INTERNAL_SERVER_ERROR, "서버 오류가 발생했습니다.");
     }
 
     private static ResponseEntity<ProblemDetail> problem(HttpStatus status, String message) {

@@ -102,6 +102,28 @@ class OutboxRelayIT extends IntegrationTestSupport {
         assertThat(redis.opsForList().range(RedisKeys.OUTBOX, 0, -1)).containsExactly(ENTRIES.get(2), ENTRIES.get(3));
     }
 
+    @Test
+    void 잠금을_가진_채여도_목록_앞부분이_발행한_항목과_다르면_지우지_않는다() throws Exception {
+        CompletableFuture<SendResult<String, String>> pending = new CompletableFuture<>();
+        AtomicInteger sends = new AtomicInteger();
+        @SuppressWarnings("unchecked")
+        KafkaTemplate<String, String> slowKafka = mock(KafkaTemplate.class);
+        when(slowKafka.send(anyString(), anyString(), anyString())).thenAnswer(invocation -> {
+            sends.incrementAndGet();
+            return pending;
+        });
+        OutboxRelay relay = new OutboxRelay(redis, slowKafka, objectMapper, properties, metrics);
+
+        CompletableFuture<Integer> run = CompletableFuture.supplyAsync(relay::relayOnce);
+        await().atMost(Duration.ofSeconds(5)).until(() -> sends.get() == 2);
+        // 잠금은 이 릴레이가 그대로 가진 채, 다른 경로(운영자 정리 등)가 앞의 1·2번을 먼저 지웠다.
+        redis.opsForList().trim(RedisKeys.OUTBOX, 2, -1);
+
+        pending.complete(null);
+        assertThat(run.get(10, TimeUnit.SECONDS)).as("지운 건수").isZero();
+        assertThat(redis.opsForList().range(RedisKeys.OUTBOX, 0, -1)).containsExactly(ENTRIES.get(2), ENTRIES.get(3));
+    }
+
     @SuppressWarnings("unchecked")
     private static KafkaTemplate<String, String> kafkaReturning(CompletableFuture<SendResult<String, String>> result) {
         KafkaTemplate<String, String> kafka = mock(KafkaTemplate.class);

@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
@@ -108,59 +109,68 @@ public class VehicleLocationRepository {
      */
     public List<NearbyVehicle> searchNearby(double latitude, double longitude, double radiusKm,
                                             long activeSinceMillis, int limit) {
+        return searchNearby(latitude, longitude, radiusKm, activeSinceMillis, limit, vehicle -> true);
+    }
+
+    /**
+     * 조건(filter)을 만족하는 활성 차량을 가까운 순으로 최대 limit 대 돌려준다. 상한은 조건을 적용한 뒤에 센다.
+     */
+    public List<NearbyVehicle> searchNearby(double latitude, double longitude, double radiusKm,
+                                            long activeSinceMillis, int limit, Predicate<NearbyVehicle> filter) {
         // GEOSEARCH key FROMLONLAT lng lat BYRADIUS r km WITHDIST ASC
-        // COUNT 는 주지 않는다. 비활성 차량을 걸러 낸 뒤에 개수를 자르기 위해서다(반경이 상한이라 결과가 유한하다).
+        // COUNT 는 주지 않는다. 비활성·조건 불일치 차량을 걸러 낸 뒤에 개수를 자르기 위해서다(반경이 상한이라 결과가 유한하다).
         GeoResults<GeoLocation<String>> results = redis.opsForGeo().search(
                 RedisKeys.VEHICLE_GEO,
                 GeoReference.fromCoordinate(longitude, latitude),
                 new Distance(radiusKm, Metrics.KILOMETERS),
                 GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().sortAscending());
-        if (results == null || results.getContent().isEmpty()) {
+        if (results == null || results.getContent().isEmpty() || limit <= 0) {
             return List.of();
         }
 
         List<GeoResult<GeoLocation<String>>> hits = results.getContent();
         Object[] ids = hits.stream().map(hit -> hit.getContent().getName()).toArray();
         List<Double> lastSeen = redis.opsForZSet().score(RedisKeys.VEHICLE_LAST_SEEN, ids);
-
         List<String> activeIds = new ArrayList<>();
         List<Double> activeDistances = new ArrayList<>();
-        for (int i = 0; i < hits.size() && activeIds.size() < limit; i++) {
+        for (int i = 0; i < hits.size(); i++) {
             Double seen = lastSeen == null ? null : lastSeen.get(i);
             if (seen != null && seen.longValue() >= activeSinceMillis) {
                 activeIds.add((String) ids[i]);
                 activeDistances.add(hits.get(i).getDistance().getValue());
             }
         }
-        if (activeIds.isEmpty()) {
-            return List.of();
-        }
 
-        // 차량별 최신 상태를 파이프라인 한 번으로 읽는다(N 번 왕복 방지).
-        List<Object> hashes = redis.executePipelined((RedisCallback<Object>) connection -> {
-            for (String id : activeIds) {
-                connection.hashCommands().hGetAll(RedisKeys.vehicleLatest(id).getBytes(StandardCharsets.UTF_8));
+        // 가까운 순으로 limit 대씩 최신 상태를 파이프라인으로 읽어, 조건을 만족하는 차량이 limit 대가 될 때까지 채운다.
+        List<NearbyVehicle> vehicles = new ArrayList<>();
+        for (int from = 0; from < activeIds.size() && vehicles.size() < limit; from += limit) {
+            List<String> chunk = activeIds.subList(from, Math.min(from + limit, activeIds.size()));
+            List<Object> hashes = redis.executePipelined((RedisCallback<Object>) connection -> {
+                for (String id : chunk) {
+                    connection.hashCommands().hGetAll(RedisKeys.vehicleLatest(id).getBytes(StandardCharsets.UTF_8));
+                }
+                return null;
+            });
+            for (int i = 0; i < chunk.size() && vehicles.size() < limit; i++) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> hash = (Map<String, String>) hashes.get(i);
+                if (hash == null || hash.isEmpty()) {
+                    continue; // 최신 상태가 만료됐는데 인덱스만 남은 경우
+                }
+                VehicleSnapshot snapshot = VehicleSnapshot.fromHash(hash);
+                NearbyVehicle vehicle = new NearbyVehicle(
+                        snapshot.vehicleId(),
+                        snapshot.latitude(),
+                        snapshot.longitude(),
+                        Math.round(activeDistances.get(from + i) * 1000.0) / 1000.0,
+                        snapshot.speed(),
+                        snapshot.batterySoc(),
+                        snapshot.engineStatus(),
+                        snapshot.timestamp());
+                if (filter.test(vehicle)) {
+                    vehicles.add(vehicle);
+                }
             }
-            return null;
-        });
-
-        List<NearbyVehicle> vehicles = new ArrayList<>(activeIds.size());
-        for (int i = 0; i < activeIds.size(); i++) {
-            @SuppressWarnings("unchecked")
-            Map<String, String> hash = (Map<String, String>) hashes.get(i);
-            if (hash == null || hash.isEmpty()) {
-                continue; // 최신 상태가 만료됐는데 인덱스만 남은 경우
-            }
-            VehicleSnapshot snapshot = VehicleSnapshot.fromHash(hash);
-            vehicles.add(new NearbyVehicle(
-                    snapshot.vehicleId(),
-                    snapshot.latitude(),
-                    snapshot.longitude(),
-                    Math.round(activeDistances.get(i) * 1000.0) / 1000.0,
-                    snapshot.speed(),
-                    snapshot.batterySoc(),
-                    snapshot.engineStatus(),
-                    snapshot.timestamp()));
         }
         return vehicles;
     }

@@ -116,6 +116,20 @@ class SecurityIT extends IntegrationTestSupport {
     }
 
     @Test
+    void 만료_시각_exp_가_없는_토큰은_401() throws Exception {
+        NimbusJwtEncoder encoder = new NimbusJwtEncoder(new ImmutableSecret<>(new SecretKeySpec(
+                "test-only-secret-0123456789-abcdefghijklmnop".getBytes(StandardCharsets.UTF_8), "HmacSHA256")));
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .issuer("mini-fms").subject("forever").issuedAt(Instant.now())
+                .claim("scope", Scopes.FLEET_READ)
+                .build(); // exp 없음 → 영구 토큰
+        String token = encoder.encode(JwtEncoderParameters.from(JwsHeader.with(MacAlgorithm.HS256).build(), claims)).getTokenValue();
+
+        mockMvc.perform(get("/api/v1/geofences").header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
     void 헬스체크는_공개이고_개발용_토큰_발급은_테스트_프로필에서_꺼져_있다() throws Exception {
         mockMvc.perform(get("/actuator/health")).andExpect(status().isOk());
         mockMvc.perform(post("/api/v1/auth/dev-token").contentType(MediaType.APPLICATION_JSON).content("{\"subject\":\"x\"}"))

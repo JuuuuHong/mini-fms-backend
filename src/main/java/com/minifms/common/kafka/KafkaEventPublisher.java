@@ -81,6 +81,18 @@ public class KafkaEventPublisher {
         return false;
     }
 
+    /** 재시도하면 될 수 있는 Kafka 오류(브로커 장애·시간 초과·네트워크 오류)인가. 원인 사슬을 따라 확인한다. */
+    public static boolean isRetriable(Throwable error) {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 10; depth++) {
+            if (current instanceof RetriableException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
     public String toJson(Object payload) {
         try {
             return objectMapper.writeValueAsString(payload);

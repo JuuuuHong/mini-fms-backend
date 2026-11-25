@@ -9,6 +9,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.minifms.common.config.properties.IncidentProperties;
@@ -17,6 +18,7 @@ import com.minifms.common.config.properties.TopicProperties;
 import com.minifms.common.idempotency.IdempotencyGuard;
 import com.minifms.common.kafka.EventPublishException;
 import com.minifms.common.kafka.KafkaEventPublisher;
+import com.minifms.common.metrics.FmsMetrics;
 import com.minifms.incident.history.IncidentHistoryView;
 import com.minifms.security.Scopes;
 import com.minifms.support.IntegrationTestSupport;
@@ -70,6 +72,10 @@ class IncidentHistoryIT extends IntegrationTestSupport {
     LocationProperties locationProperties;
     @Autowired
     Clock clock;
+    @Autowired
+    FmsMetrics metrics;
+    @Autowired
+    ElasticsearchClient elasticsearchClient;
 
     @Test
     void 기간과_유형으로_최신_발생_순_페이지를_돌려주고_같은_시각은_incidentId_순으로_고정된다() throws Exception {
@@ -132,6 +138,10 @@ class IncidentHistoryIT extends IntegrationTestSupport {
         expectBadRequest(from, "2001-03-02T00:00:00Z", "FLYING_CAR", null);
         expectBadRequest("어제", "2001-03-02T00:00:00Z", null, null);
         expectBadRequest(from, "2001-03-02T00:00:00Z", null, "101");  // size 상한 100
+        mockMvc.perform(get("/api/v1/incidents").param("from", from).param("to", "2001-03-02T00:00:00Z")
+                        .param("page", String.valueOf(Integer.MAX_VALUE)).param("size", "20")
+                        .with(withScopes(Scopes.FLEET_READ)))
+                .andExpect(status().isBadRequest());                   // page 정수 오버플로
         mockMvc.perform(get("/api/v1/incidents").param("from", from).with(withScopes(Scopes.FLEET_READ)))
                 .andExpect(status().isBadRequest());                   // to 없음
     }
@@ -200,7 +210,9 @@ class IncidentHistoryIT extends IntegrationTestSupport {
         Instant now = Instant.now();
 
         pauseElasticsearch();
+        long pausedAt = System.nanoTime();
         try {
+            double indexedBefore = metrics.count(FmsMetrics.INCIDENT_HISTORY_INDEXED);
             postIncident(incidentId, IncidentType.ROAD_DEBRIS, lat, lng, now)
                     .andExpect(status().isAccepted())
                     .andExpect(jsonPath("$.recipients").value(2));
@@ -218,6 +230,14 @@ class IncidentHistoryIT extends IntegrationTestSupport {
                     .andExpect(header().string(HttpHeaders.RETRY_AFTER, "5"));
             mockMvc.perform(get("/api/v1/incidents/{id}", incidentId).with(withScopes(Scopes.FLEET_READ)))
                     .andExpect(status().isServiceUnavailable());
+
+            // 정지를 색인기 재시도 간격 상한(5초)의 몇 배로 유지한다. 그동안 색인은 늘지 않고(실패·재시도 중),
+            // 재시도 횟수·시간에 상한이 있었다면 결과를 버렸을 것이므로 아래 "복구 뒤 조회"가 실패한다.
+            long remaining = Duration.ofSeconds(15).toNanos() - (System.nanoTime() - pausedAt);
+            if (remaining > 0) {
+                Thread.sleep(remaining / 1_000_000);
+            }
+            assertThat(metrics.count(FmsMetrics.INCIDENT_HISTORY_INDEXED)).as("정지 중 색인 없음").isEqualTo(indexedBefore);
         } finally {
             resumeElasticsearch();
         }
@@ -262,8 +282,36 @@ class IncidentHistoryIT extends IntegrationTestSupport {
         assertThat(history.confirmedCount()).isEqualTo(3);
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             JsonNode page = search(occurredAt.minusSeconds(60), occurredAt.plusSeconds(60), null, 0, 100);
+            // 문서 ID 가 incidentId 라 한 건인 것은 구조상 보장된다. 이 테스트의 핵심 증명은 위의 "버전 2000 유지"다.
             assertThat(ids(page)).containsOnlyOnce(incidentId).contains(marker + "-1", marker + "-2");
         });
+    }
+
+    @Test
+    void 운영_중_색인이_사라져도_매핑을_지정해_다시_만들고_검색이_계속_된다() throws Exception {
+        Instant now = Instant.now();
+        String before = TestEvents.uniqueId("HX");
+        postIncident(before, IncidentType.HARD_BRAKING, OCEAN_LAT, OCEAN_LNG, now).andExpect(status().isAccepted());
+        awaitHistory(before, view -> true);
+
+        // 볼륨 없는 재생성·운영자 삭제 등으로 실제 색인과 별칭이 사라진다.
+        elasticsearchClient.indices().delete(d -> d.index("c-its-incidents-v1"));
+
+        String after = TestEvents.uniqueId("HX");
+        postIncident(after, IncidentType.HARD_BRAKING, OCEAN_LAT, OCEAN_LNG, now.plusSeconds(1)).andExpect(status().isAccepted());
+        awaitHistory(after, view -> true);
+
+        // 동적 매핑으로 자동 생성되지 않고, strict 매핑의 실제 색인 + 별칭으로 다시 만들어졌다.
+        var mappings = elasticsearchClient.indices().getMapping(m -> m.index("c-its-incidents")).result();
+        assertThat(mappings).containsOnlyKeys("c-its-incidents-v1");
+        var properties = mappings.get("c-its-incidents-v1").mappings().properties();
+        assertThat(properties.get("type").isKeyword()).isTrue();
+        assertThat(properties.get("incidentId").isKeyword()).isTrue();
+        assertThat(properties.get("location").isGeoPoint()).isTrue();
+        // 정렬(incidentId)·유형 필터 검색이 정상 동작한다.
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(ids(search(now.minusSeconds(60), now.plusSeconds(60), IncidentType.HARD_BRAKING, 0, 100)))
+                        .contains(after));
     }
 
     // ---- 도우미 ----
