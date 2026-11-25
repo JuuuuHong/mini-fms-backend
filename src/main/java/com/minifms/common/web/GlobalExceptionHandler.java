@@ -1,8 +1,10 @@
 package com.minifms.common.web;
 
 import com.minifms.common.kafka.EventPublishException;
+import com.minifms.incident.history.HistoryUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -42,6 +44,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handlePublishFailure(EventPublishException e) {
         log.error("Kafka 발행 실패", e);
         return problem(HttpStatus.SERVICE_UNAVAILABLE, "메시지 브로커에 기록하지 못했습니다. 잠시 뒤 다시 시도하세요.");
+    }
+
+    @ExceptionHandler(HistoryUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleHistoryUnavailable(HistoryUnavailableException e) {
+        log.warn("관제 이력 저장소 장애: {}", e.getCause() == null ? e.getMessage() : e.getCause().toString());
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "5")
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage()));
     }
 
     private static ResponseEntity<ProblemDetail> problem(HttpStatus status, String message) {

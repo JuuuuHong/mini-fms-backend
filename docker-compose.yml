@@ -69,6 +69,27 @@ services:
       timeout: 3s
       retries: 20
 
+  # 돌발상황 관제 이력 검색. 로컬 개발용이라 보안(xpack)을 끄고 단일 노드로 띄운다.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    container_name: fms-elasticsearch
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      # 노트북 디스크가 차 있어도 읽기 전용으로 바뀌지 않게 한다(로컬 전용).
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
   app:
     profiles: ["app"]
     build: .
@@ -84,6 +105,7 @@ services:
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-fms}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-fms_local}
+      ELASTICSEARCH_URIS: http://elasticsearch:9200
     depends_on:
       kafka:
         condition: service_healthy
@@ -91,6 +113,9 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # 이력 검색은 부가 기능이라 Elasticsearch 가 준비되지 않아도 앱은 뜬다.
+      elasticsearch:
+        condition: service_started
 
   kafka-ui:
     profiles: ["tools"]
@@ -108,3 +133,4 @@ services:
 volumes:
   redis-data:
   clickhouse-data:
+  elasticsearch-data:

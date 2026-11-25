@@ -45,6 +45,12 @@ spring:
       mode: always
       schema-locations: classpath:clickhouse/schema.sql
 
+  # Elasticsearch — 돌발상황 관제 이력 검색. 꺼져 있어도 앱은 뜨고 접수·경고 발행은 계속된다.
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+    connection-timeout: 1s
+    socket-timeout: 3s
+
   task:
     scheduling:
       pool:
@@ -69,6 +75,11 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+  health:
+    # 이력 검색 저장소 장애가 앱 전체를 DOWN(→ 트래픽 차단)으로 만들면 접수·경고 발행까지 멈춘다.
+    # 이력 검색의 장애는 검색 API 의 503 으로만 드러낸다.
+    elasticsearch:
+      enabled: false
 
 fms:
   topics:
@@ -79,6 +90,7 @@ fms:
     command-acks: vehicle-command-acks
     command-compensations: vehicle-command-compensations
     incident-alerts: c-its-incident-alerts
+    incident-results: c-its-incident-results
     partitions: 6
     replication-factor: 1
 
@@ -119,6 +131,11 @@ fms:
   incident:
     alert-radius-km: 2.0
     alert-ttl: 10m
+
+  incident-history:
+    index: c-its-incidents
+    max-search-range: 31d
+    max-page-size: 100
 
   outbox:
     relay-interval: 200ms

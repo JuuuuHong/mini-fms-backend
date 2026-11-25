@@ -20,6 +20,9 @@ public class FmsMetrics {
     public static final String COMMANDS_FINISHED = "fms.command.finished";
     public static final String COMMAND_LATE_ACKS = "fms.command.late_acks";
     public static final String OUTBOX_PUBLISHED = "fms.outbox.published";
+    public static final String INCIDENT_HISTORY_INDEXED = "fms.incident.history.indexed";
+    public static final String INCIDENT_HISTORY_STALE = "fms.incident.history.stale";
+    public static final String INCIDENT_HISTORY_REJECTED = "fms.incident.history.rejected";
 
     private final MeterRegistry registry;
 
@@ -61,6 +64,21 @@ public class FmsMetrics {
 
     public void outboxPublished(int count) {
         increment(registry.counter(OUTBOX_PUBLISHED), count);
+    }
+
+    /** 이력 색인에 반영된 처리 결과 수. */
+    public void incidentHistoryIndexed(int count) {
+        increment(registry.counter(INCIDENT_HISTORY_INDEXED), count);
+    }
+
+    /** 이미 같은·더 최신 버전이 있어 버린 처리 결과 수(재전달·늦은 도착). */
+    public void incidentHistoryStale(int count) {
+        increment(registry.counter(INCIDENT_HISTORY_STALE), count);
+    }
+
+    /** 재시도해도 소용없는 이유로 색인하지 못한 처리 결과 수(해석 불가·매핑 오류). */
+    public void incidentHistoryRejected(int count) {
+        increment(registry.counter(INCIDENT_HISTORY_REJECTED), count);
     }
 
     /** 테스트·진단용: 현재 누적값. */

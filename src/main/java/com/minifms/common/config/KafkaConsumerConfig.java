@@ -25,6 +25,7 @@ public class KafkaConsumerConfig {
 
     public static final String REALTIME_FACTORY = "realtimeBatchFactory";
     public static final String HISTORY_FACTORY = "historyBatchFactory";
+    public static final String INCIDENT_INDEXER_FACTORY = "incidentIndexerFactory";
 
     private static final Logger log = LoggerFactory.getLogger(KafkaConsumerConfig.class);
 
@@ -44,6 +45,23 @@ public class KafkaConsumerConfig {
                 (record, ex) -> log.error("실시간 라우팅 재시도 소진, 메시지를 건너뜁니다. topic={} partition={} offset={} key={}",
                         record.topic(), record.partition(), record.offset(), record.key(), ex),
                 backOff));
+        return factory;
+    }
+
+    /**
+     * 돌발상황 이력 색인용. Elasticsearch 가 멈추면 결과를 버리지 않고 무기한 재시도한다(그동안 lag 만 쌓이고,
+     * 복구되면 밀린 결과를 처리한다). 복구를 빨리 알아채도록 재시도 간격 상한을 5초로 둔다.
+     */
+    @Bean(INCIDENT_INDEXER_FACTORY)
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> incidentIndexerFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        configurer.configure(factory, consumerFactory);
+        factory.setBatchListener(true);
+        ExponentialBackOff backOff = new ExponentialBackOff(500L, 2.0);
+        backOff.setMaxInterval(5_000L);
+        factory.setCommonErrorHandler(new DefaultErrorHandler(backOff));
         return factory;
     }
 

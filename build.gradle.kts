@@ -25,6 +25,9 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-jdbc")
     implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
     implementation("org.springframework.kafka:spring-kafka")
+    // 돌발상황 관제 이력 검색(Elasticsearch Java API Client, 버전은 Spring Boot 가 관리)
+    implementation("co.elastic.clients:elasticsearch-java")
+    implementation("org.elasticsearch.client:elasticsearch-rest-client")
     // ClickHouse JDBC(HTTP 8123). Spring Boot 가 버전을 관리하지 않으므로 직접 고정한다.
     implementation("com.clickhouse:clickhouse-jdbc:0.9.9")
 
@@ -36,6 +39,7 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter")
     testImplementation("org.testcontainers:kafka")
     testImplementation("org.testcontainers:clickhouse")
+    testImplementation("org.testcontainers:elasticsearch")
     testImplementation("org.awaitility:awaitility")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

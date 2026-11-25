@@ -14,14 +14,16 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.clickhouse.ClickHouseContainer;
+import org.testcontainers.elasticsearch.ElasticsearchContainer;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.lifecycle.Startables;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * 통합 테스트 공통 기반. Kafka·Redis·ClickHouse 컨테이너를 JVM 당 한 번 띄우고(싱글턴),
+ * 통합 테스트 공통 기반. Kafka·Redis·ClickHouse·Elasticsearch 컨테이너를 JVM 당 한 번 띄우고(싱글턴),
  * 모든 테스트 클래스가 같은 Spring 컨텍스트를 재사용한다. 테스트끼리 상태를 공유하므로
  * 각 테스트는 고유한 vehicleId·좌표를 쓴다.
  */
@@ -38,8 +40,14 @@ public abstract class IntegrationTestSupport {
             new ClickHouseContainer(DockerImageName.parse("clickhouse/clickhouse-server:24.8"))
                     .withDatabaseName("fms");
 
+    protected static final ElasticsearchContainer ELASTICSEARCH =
+            new ElasticsearchContainer(DockerImageName.parse("docker.elastic.co/elasticsearch/elasticsearch:8.18.8"))
+                    .withEnv("xpack.security.enabled", "false")
+                    .withEnv("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
+                    .withEnv("cluster.routing.allocation.disk.threshold_enabled", "false");
+
     static {
-        Startables.deepStart(KAFKA, REDIS, CLICKHOUSE).join();
+        Startables.deepStart(KAFKA, REDIS, CLICKHOUSE, ELASTICSEARCH).join();
     }
 
     @DynamicPropertySource
@@ -50,6 +58,16 @@ public abstract class IntegrationTestSupport {
         registry.add("spring.datasource.url", CLICKHOUSE::getJdbcUrl);
         registry.add("spring.datasource.username", CLICKHOUSE::getUsername);
         registry.add("spring.datasource.password", CLICKHOUSE::getPassword);
+        registry.add("spring.elasticsearch.uris", () -> "http://" + ELASTICSEARCH.getHttpHostAddress());
+    }
+
+    /** Elasticsearch 를 일시 정지한다(프로세스는 살아 있지만 응답하지 않는 장애). 반드시 {@link #resumeElasticsearch()} 로 되돌린다. */
+    protected static void pauseElasticsearch() {
+        DockerClientFactory.lazyClient().pauseContainerCmd(ELASTICSEARCH.getContainerId()).exec();
+    }
+
+    protected static void resumeElasticsearch() {
+        DockerClientFactory.lazyClient().unpauseContainerCmd(ELASTICSEARCH.getContainerId()).exec();
     }
 
     @Autowired
