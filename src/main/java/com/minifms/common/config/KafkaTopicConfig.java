@@ -25,7 +25,9 @@ public class KafkaTopicConfig {
                 topic(topics, topics.commands(), Duration.ofDays(1)),
                 topic(topics, topics.commandAcks(), Duration.ofDays(1)),
                 topic(topics, topics.commandCompensations(), Duration.ofDays(7)),
-                topic(topics, topics.incidentAlerts(), Duration.ofDays(1)));
+                topic(topics, topics.incidentAlerts(), Duration.ofDays(1)),
+                // 색인 소비자가 Elasticsearch 장애로 밀려도 복구 뒤 처리할 수 있게 넉넉히 보존한다.
+                topic(topics, topics.incidentResults(), Duration.ofDays(7)));
     }
 
     private static NewTopic topic(TopicProperties topics, String name, Duration retention) {

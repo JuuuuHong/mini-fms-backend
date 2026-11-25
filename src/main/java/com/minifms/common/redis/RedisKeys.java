@@ -50,6 +50,11 @@ public final class RedisKeys {
         return "fms:geofence:" + fenceId + ":inside";
     }
 
+    /** 돌발상황 처리 결과의 마지막 버전(string). 이력 색인이 늦게 도착한 이전 결과를 버리는 기준이다. */
+    public static String incidentResultVersion(String incidentId) {
+        return "fms:incident:" + incidentId + ":result-version";
+    }
+
     /** 멱등키(string). 값은 처리 토큰(선점 중) 또는 DONE(처리 완료). */
     public static String idempotency(String namespace, String businessKey) {
         return "fms:dedup:" + namespace + ":" + businessKey;
