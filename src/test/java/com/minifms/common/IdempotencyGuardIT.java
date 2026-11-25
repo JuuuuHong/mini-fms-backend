@@ -14,7 +14,10 @@ import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import com.minifms.common.redis.RedisKeys;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 
 /** Redis 멱등 처리기: 선점·중복·처리 중·해제·윈도우 만료. */
 class IdempotencyGuardIT extends IntegrationTestSupport {
@@ -64,6 +67,22 @@ class IdempotencyGuardIT extends IntegrationTestSupport {
 
         assertThat(guard.release(first, List.of("V-2:1000"))).isEqualTo(1);
         assertThat(guard.claim(namespace, List.of("V-2:1000")).status(0)).isEqualTo(ClaimStatus.CLAIMED);
+    }
+
+    @Test
+    void 연결이_끊겨_같은_선점_요청이_다시_실행돼도_자기_선점을_중복으로_보지_않는다() {
+        @SuppressWarnings("rawtypes")
+        RedisScript<List> claimScript = RedisScript.of(new ClassPathResource("scripts/idempotency_claim.lua"), List.class);
+        List<String> keys = List.of(RedisKeys.idempotency(namespace, "V-9:1000"), RedisKeys.idempotency(namespace, "V-9:1000"));
+
+        // 클라이언트(Lettuce)는 응답을 받지 못한 명령을 재연결 뒤 다시 보낸다 → 같은 토큰으로 스크립트가 두 번 실행된다.
+        List<?> first = redis.execute(claimScript, keys, "P:same-attempt", "5000");
+        List<?> resent = redis.execute(claimScript, keys, "P:same-attempt", "5000");
+        List<?> other = redis.execute(claimScript, keys, "P:other-attempt", "5000");
+
+        assertThat(first.stream().map(String::valueOf).toList()).containsExactly("CLAIMED", "DUPLICATE");
+        assertThat(resent.stream().map(String::valueOf).toList()).as("재실행은 여전히 내 선점(배치 안 두 번째는 중복)").containsExactly("CLAIMED", "DUPLICATE");
+        assertThat(other.stream().map(String::valueOf).toList()).as("다른 시도에게는 처리 중").containsExactly("IN_FLIGHT", "DUPLICATE");
     }
 
     @Test

@@ -101,7 +101,11 @@ fms:
     history-concurrency: 3
 
   telematics:
-    max-future-skew: 5m
+    # 받을 수 있는 측정 시각 범위(단말에 대한 가정):
+    #   max-past-age    — 통신 두절 동안 버퍼에 모아 두었다가 올리는 기간
+    #   max-future-skew — 단말 시계 오차 허용 폭(앞선 시각 한 건이 그 시각까지 최신 위치 갱신을 멈추게 하므로 작게)
+    max-past-age: 7d
+    max-future-skew: 30s
     publish-timeout: 3s
 
   idempotency:

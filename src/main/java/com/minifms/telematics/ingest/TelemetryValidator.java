@@ -33,9 +33,12 @@ public class TelemetryValidator {
         if (!violations.isEmpty()) {
             return violations;
         }
-        long maxAllowed = clock.millis() + properties.maxFutureSkew().toMillis();
-        if (event.timestamp() > maxAllowed) {
+        long now = clock.millis();
+        if (event.timestamp() > now + properties.maxFutureSkew().toMillis()) {
             return List.of("timestamp: 서버 시각보다 " + properties.maxFutureSkew() + " 넘게 앞섭니다(단말 시계 확인 필요)");
+        }
+        if (event.timestamp() < now - properties.maxPastAge().toMillis()) {
+            return List.of("timestamp: " + properties.maxPastAge() + " 보다 오래된 측정값은 받지 않습니다(단말 오프라인 버퍼 허용 범위 밖)");
         }
         return List.of();
     }

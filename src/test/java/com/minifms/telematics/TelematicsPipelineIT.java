@@ -148,15 +148,26 @@ class TelematicsPipelineIT extends IntegrationTestSupport {
                         .content(body))
                 .andExpect(status().isBadRequest());
 
-        // 서버 시각보다 한참 앞선 timestamp(단말 시계 오류)
-        TelematicsEvent future = TestEvents.northOf(TestEvents.uniqueId("API"), LAT, LNG, 0,
-                System.currentTimeMillis() + Duration.ofHours(1).toMillis());
-        mockMvc.perform(post("/api/v1/telematics")
-                        .with(withScopes(Scopes.TELEMATICS_WRITE))
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(future)))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.violations[0]").exists());
+        // 받을 수 있는 측정 시각: 과거 7일 ~ 미래 30초(테스트 프로필도 기본값)
+        long now = System.currentTimeMillis();
+        for (long timestamp : new long[] {now + Duration.ofMinutes(1).toMillis(), now - Duration.ofDays(8).toMillis()}) {
+            TelematicsEvent outOfWindow = TestEvents.northOf(TestEvents.uniqueId("API"), LAT, LNG, 0, timestamp);
+            mockMvc.perform(post("/api/v1/telematics")
+                            .with(withScopes(Scopes.TELEMATICS_WRITE))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(outOfWindow)))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.violations[0]").value(org.hamcrest.Matchers.startsWith("events[0].timestamp")));
+        }
+        // 경계 안(6일 전, 10초 뒤)은 받는다
+        for (long timestamp : new long[] {now - Duration.ofDays(6).toMillis(), now + 10_000}) {
+            TelematicsEvent inWindow = TestEvents.northOf(TestEvents.uniqueId("API"), LAT, LNG, 0, timestamp);
+            mockMvc.perform(post("/api/v1/telematics")
+                            .with(withScopes(Scopes.TELEMATICS_WRITE))
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(inWindow)))
+                    .andExpect(status().isAccepted());
+        }
     }
 
     private void send(TelematicsEvent event) {
