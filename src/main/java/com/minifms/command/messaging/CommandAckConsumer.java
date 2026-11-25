@@ -3,6 +3,7 @@ package com.minifms.command.messaging;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.minifms.command.VehicleCommandService;
+import com.minifms.common.config.KafkaConsumerConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -25,7 +26,8 @@ public class CommandAckConsumer {
     @KafkaListener(
             id = "command-ack-handler",
             groupId = "${fms.consumers.command-ack-group:fms-command-ack-handler}",
-            topics = "${fms.topics.command-acks:vehicle-command-acks}")
+            topics = "${fms.topics.command-acks:vehicle-command-acks}",
+            containerFactory = KafkaConsumerConfig.COMMAND_ACK_FACTORY)
     public void onAck(String payload) {
         VehicleCommandAck ack;
         try {

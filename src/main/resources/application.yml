@@ -13,7 +13,9 @@ spring:
         # 재시도로 인한 중복·순서 뒤바뀜을 브로커가 막는다(파티션 단위).
         enable.idempotence: true
         linger.ms: 5
-        max.block.ms: 10000
+        # 브로커 메타데이터를 얻지 못할 때 send() 가 호출 스레드를 붙잡는 최대 시간. 제어·접수 API 스레드가
+        # 브로커 장애 동안 오래 묶이지 않도록 응답 확인 대기(publish-timeout·transmit-timeout)와 같은 수준으로 둔다.
+        max.block.ms: 3000
         request.timeout.ms: 10000
         delivery.timeout.ms: 30000
     consumer:
@@ -125,6 +127,9 @@ fms:
     ack-timeout: 5s
     timeout-scan-interval: 500ms
     transmit-timeout: 3s
+    # 차량 실행 마감(expiresAt) = 요청 시각 + ack-timeout - 이 값. 마감 직전에 실행한 명령의 ACK 가
+    # 서버 마감 전에 도착할 여유(ACK 전달 지연에 대한 가정)다.
+    device-execution-margin: 1500ms
     lock-grace: 10s
     record-retention: 24h
 

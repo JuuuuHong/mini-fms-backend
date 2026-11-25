@@ -13,6 +13,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param lockGrace            차량별 명령 잠금은 ackTimeout + lockGrace 뒤 자동 해제된다(스케줄러가 멈춘 경우의 안전장치).
  * @param recordRetention      명령 기록 보존 기간.
  * @param timeoutScanBatchSize 한 번에 검사하는 만료 후보 수.
+ * @param deviceExecutionMargin 차량 실행 마감(expiresAt)을 서버 응답 마감보다 이만큼 앞당긴다. 차량이 마감 직전에
+ *                              실행해도 ACK 가 서버 마감 전에 도착할 여유다(ACK 전달 지연에 대한 가정, 초기값 1.5초).
+ *                              ackTimeout 보다 작아야 한다.
  */
 @ConfigurationProperties(prefix = "fms.command")
 public record CommandProperties(
@@ -21,5 +24,18 @@ public record CommandProperties(
         @DefaultValue("3s") Duration transmitTimeout,
         @DefaultValue("10s") Duration lockGrace,
         @DefaultValue("24h") Duration recordRetention,
-        @DefaultValue("100") int timeoutScanBatchSize) {
+        @DefaultValue("100") int timeoutScanBatchSize,
+        @DefaultValue("1500ms") Duration deviceExecutionMargin) {
+
+    public CommandProperties {
+        if (deviceExecutionMargin.isNegative() || deviceExecutionMargin.compareTo(ackTimeout) >= 0) {
+            throw new IllegalArgumentException(
+                    "fms.command.device-execution-margin 은 0 이상, ack-timeout(" + ackTimeout + ") 미만이어야 합니다");
+        }
+    }
+
+    /** 차량이 명령을 실행해도 되는 마지막 시각(epoch ms). */
+    public long deviceExpiresAt(long requestedAt) {
+        return requestedAt + ackTimeout.toMillis() - deviceExecutionMargin.toMillis();
+    }
 }

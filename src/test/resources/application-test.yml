@@ -22,6 +22,9 @@ fms:
 
   command:
     ack-timeout: 2s
+    device-execution-margin: 500ms
+    # 발행 확인이 늦는 경우를 빨리 재현하려고 짧게 둔다.
+    transmit-timeout: 1s
     timeout-scan-interval: 200ms
 
   outbox:

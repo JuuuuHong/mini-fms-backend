@@ -19,6 +19,7 @@ public class FmsMetrics {
     public static final String GEOFENCE_TRANSITIONS = "fms.geofence.transitions";
     public static final String COMMANDS_FINISHED = "fms.command.finished";
     public static final String COMMAND_LATE_ACKS = "fms.command.late_acks";
+    public static final String COMMAND_TRANSMIT_UNKNOWN = "fms.command.transmit_unknown";
     public static final String OUTBOX_PUBLISHED = "fms.outbox.published";
     public static final String INCIDENT_HISTORY_INDEXED = "fms.incident.history.indexed";
     public static final String INCIDENT_HISTORY_STALE = "fms.incident.history.stale";
@@ -60,6 +61,11 @@ public class FmsMetrics {
 
     public void lateAck() {
         registry.counter(COMMAND_LATE_ACKS).increment();
+    }
+
+    /** 전송 확인이 오지 않아 결과를 모르는 명령(보상하지 않고 ACK·마감을 기다림). */
+    public void commandTransmitUnknown() {
+        registry.counter(COMMAND_TRANSMIT_UNKNOWN).increment();
     }
 
     public void outboxPublished(int count) {

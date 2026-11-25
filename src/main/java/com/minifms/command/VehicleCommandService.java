@@ -86,14 +86,26 @@ public class VehicleCommandService {
         }
 
         // 2) 전송: 브로커가 받았는지(acks=all)까지 확인한다. 차량 응답은 비동기로 온다.
+        //    차량은 서버 마감보다 deviceExecutionMargin 만큼 이른 expiresAt 까지만 실행한다(ACK 가 서버 마감 전에 도착할 여유).
         try {
             publisher.publishAndWait(topics.commands(), vehicleId,
-                    new VehicleCommandMessage(commandId, vehicleId, type, now, deadline), properties.transmitTimeout());
+                    new VehicleCommandMessage(commandId, vehicleId, type, now, properties.deviceExpiresAt(now)),
+                    properties.transmitTimeout());
             repository.transition(commandId, vehicleId, CommandStatus.TRANSMITTED, EnumSet.of(CommandStatus.REQUESTED),
                     clock.millis(), false, false, null, false, null);
         } catch (EventPublishException e) {
-            log.warn("명령 전송 실패 commandId={} vehicleId={}: {}", commandId, vehicleId, e.getMessage());
-            repository.find(commandId).ifPresent(command -> compensate(command, CommandStatus.FAILED, "TRANSMIT_FAILED", false));
+            if (e.outcomeUnknown()) {
+                // 브로커가 받았는지 모른다(확인 시간 초과 등). 프로듀서는 계속 재전송하므로 이미 차량에 전달됐을 수 있다.
+                // 실패로 확정해 보상하지 않고 진행 중(REQUESTED)으로 둔다. ACK 가 오면 ACKNOWLEDGED,
+                // 마감까지 오지 않으면 타임아웃 스케줄러가 TIMEOUT 으로 보상한다.
+                metrics.commandTransmitUnknown();
+                log.warn("명령 전송 결과를 알 수 없어 응답을 기다립니다 commandId={} vehicleId={}: {}",
+                        commandId, vehicleId, e.getMessage());
+            } else {
+                // 브로커에 기록되지 않은 것이 확실한 실패(직렬화·크기·권한 오류 등)만 바로 보상한다.
+                log.warn("명령 전송 실패 commandId={} vehicleId={}: {}", commandId, vehicleId, e.getMessage());
+                repository.find(commandId).ifPresent(command -> compensate(command, CommandStatus.FAILED, "TRANSMIT_FAILED", false));
+            }
         }
         return repository.find(commandId).orElseThrow(() -> new IllegalStateException("방금 만든 명령이 없습니다: " + commandId));
     }
@@ -125,10 +137,14 @@ public class VehicleCommandService {
                 metrics.commandFinished(command.type().name(), CommandStatus.ACKNOWLEDGED.name());
                 log.info("명령 완료 commandId={} vehicleId={} type={}", command.commandId(), command.vehicleId(), command.type());
             } else if (result.status() == CommandStatus.TIMEOUT || result.status() == CommandStatus.FAILED) {
-                // 단말이 expiresAt 을 지키면 생기지 않아야 한다. 생기면 실제 차량 상태와 제어 상태가 어긋났을 수 있다.
+                // 차량이 expiresAt 전에 실행했어도 ACK 가 늦게(전달 지연·소비 지연) 도착하면 생긴다. 서버는 이미 기록해 둔
+                // 제어 상태를 이전 값으로 되돌렸으므로, 실제 차량 상태와 서버 기록이 다를 수 있다.
+                // 자동 보정은 하지 않고(후속 과제) 지표·로그로 남겨 실제 차량 상태를 확인하게 한다.
                 metrics.lateAck();
-                log.warn("이미 {} 로 보상 처리된 명령에 성공 응답이 늦게 왔습니다. 차량 실제 상태 확인이 필요합니다 commandId={} vehicleId={}",
-                        result.status(), command.commandId(), command.vehicleId());
+                log.warn("이미 {} 로 보상 처리된 명령에 성공 응답이 늦게 왔습니다. 서버 기록({}={})과 실제 차량 상태({})가 다를 수 있어 "
+                                + "확인이 필요합니다 commandId={} vehicleId={}",
+                        result.status(), command.type().field().hashField(), command.previousValue(),
+                        command.targetValue(), command.commandId(), command.vehicleId());
             }
         } else {
             compensate(command, CommandStatus.FAILED, "REJECTED_BY_VEHICLE: " + ack.reason(), false);
@@ -140,16 +156,21 @@ public class VehicleCommandService {
         List<String> overdue = repository.findOverdueIds(clock.millis(), properties.timeoutScanBatchSize());
         int expired = 0;
         for (String commandId : overdue) {
-            Optional<VehicleCommand> command = repository.find(commandId);
-            if (command.isEmpty()) {
-                repository.removeDeadline(commandId); // 보존 기간이 지나 기록이 사라진 경우
-                continue;
-            }
-            String reason = "NO_ACK_WITHIN_" + properties.ackTimeout().toMillis() + "MS";
-            if (compensate(command.get(), CommandStatus.TIMEOUT, reason, true)) {
-                expired++;
-            } else if (command.get().status().isTerminal()) {
-                repository.removeDeadline(commandId);
+            // 한 항목의 오류(손상된 기록 등)가 나머지 명령의 타임아웃 보상을 막지 않게 항목마다 따로 처리한다.
+            try {
+                Optional<VehicleCommand> command = repository.find(commandId);
+                if (command.isEmpty()) {
+                    repository.removeDeadline(commandId); // 보존 기간이 지나 기록이 사라진 경우
+                    continue;
+                }
+                String reason = "NO_ACK_WITHIN_" + properties.ackTimeout().toMillis() + "MS";
+                if (compensate(command.get(), CommandStatus.TIMEOUT, reason, true)) {
+                    expired++;
+                } else if (command.get().status().isTerminal()) {
+                    repository.removeDeadline(commandId);
+                }
+            } catch (RuntimeException e) {
+                log.error("명령 타임아웃 처리 실패, 다음 주기에 다시 시도합니다 commandId={}: {}", commandId, e.toString());
             }
         }
         return expired;

@@ -10,6 +10,10 @@
 -- 잠금 획득 → 이전 값 스냅샷 → 목표 값 선반영(낙관적) → 명령 기록 → 마감 등록을 원자적으로 한다.
 -- 차량당 진행 중 명령을 하나로 제한해, 보상(롤백) 때 되돌릴 "이전 값"이 다른 명령에 의해 흐트러지지 않게 한다.
 local holder = redis.call('GET', KEYS[1])
+if holder == ARGV[1] then
+  -- 같은 요청이 다시 실행됐다(연결이 끊겨 클라이언트가 응답을 못 받고 스크립트를 재전송). 이미 만들어졌으므로 성공으로 본다.
+  return {1, redis.call('HGET', KEYS[3], 'previousValue') or ARGV[6]}
+end
 if holder then
   return {0, holder}
 end

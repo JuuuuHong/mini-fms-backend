@@ -5,6 +5,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.TransientDataAccessException;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.listener.DefaultErrorHandler;
@@ -26,6 +28,7 @@ public class KafkaConsumerConfig {
     public static final String REALTIME_FACTORY = "realtimeBatchFactory";
     public static final String HISTORY_FACTORY = "historyBatchFactory";
     public static final String INCIDENT_INDEXER_FACTORY = "incidentIndexerFactory";
+    public static final String COMMAND_ACK_FACTORY = "commandAckFactory";
 
     private static final Logger log = LoggerFactory.getLogger(KafkaConsumerConfig.class);
 
@@ -45,6 +48,33 @@ public class KafkaConsumerConfig {
                 (record, ex) -> log.error("실시간 라우팅 재시도 소진, 메시지를 건너뜁니다. topic={} partition={} offset={} key={}",
                         record.topic(), record.partition(), record.offset(), record.key(), ex),
                 backOff));
+        return factory;
+    }
+
+    /**
+     * 차량 명령 응답(ACK) 소비용(레코드 단위).
+     *
+     * <p>Redis 연결 장애·명령 시간 초과처럼 복구될 수 있는 오류만 무기한 재시도한다. 재시도 동안 그 파티션의 ACK 처리는
+     * 멈추지만 버리지 않으므로, Redis 가 돌아오면 실행된 명령이 ACKNOWLEDGED 로 반영된다(기본 핸들러는 즉시 10회 뒤 버린다).
+     * 그 밖의 오류(손상된 기록 등)는 재시도해도 같으므로 바로 로그를 남기고 넘어가, 뒤따르는 ACK 처리를 막지 않는다.
+     * 해석할 수 없는 메시지는 리스너가 직접 건너뛴다.
+     */
+    @Bean(COMMAND_ACK_FACTORY)
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> commandAckFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        configurer.configure(factory, consumerFactory);
+        factory.setBatchListener(false);
+        ExponentialBackOff backOff = new ExponentialBackOff(200L, 2.0);
+        backOff.setMaxInterval(5_000L);
+        DefaultErrorHandler errorHandler = new DefaultErrorHandler(
+                (record, ex) -> log.error("명령 응답 처리 실패(재시도해도 같은 오류), 건너뜁니다 partition={} offset={} value={}",
+                        record.partition(), record.offset(), record.value(), ex),
+                backOff);
+        errorHandler.defaultFalse();
+        errorHandler.addRetryableExceptions(DataAccessResourceFailureException.class, TransientDataAccessException.class);
+        factory.setCommonErrorHandler(errorHandler);
         return factory;
     }
 
