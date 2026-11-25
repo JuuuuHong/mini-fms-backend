@@ -5,7 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.minifms.common.config.properties.OutboxProperties;
 import com.minifms.common.metrics.FmsMetrics;
 import com.minifms.common.redis.RedisKeys;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -28,9 +32,11 @@ import org.springframework.stereotype.Component;
  * 그래서 Lua 스크립트가 상태 변경과 아웃박스 적재를 원자적으로 하고, 발행은 이 릴레이가 재시도한다.
  *
  * <ul>
- *   <li>여러 인스턴스 중 잠금을 가진 하나만 릴레이한다(LTRIM 이 서로의 항목을 지우지 않도록).</li>
+ *   <li>여러 인스턴스 중 잠금을 가진 하나만 릴레이한다.</li>
  *   <li>앞에서부터 연속으로 발행 확인된 항목만 지운다. 중간에 실패하면 그 뒤는 다음 주기에 다시 보내므로
- *       중복 발행될 수 있다. 소비자는 이벤트의 고유 ID(alertId·eventId)로 중복을 거른다.</li>
+ *       중복 발행될 수 있다. 소비자는 이벤트의 고유 ID(alertId·eventId·incidentId+version)로 중복을 거른다.</li>
+ *   <li>삭제는 "아직 잠금 소유자인가 + 목록 앞부분이 발행한 항목과 같은가"를 Lua 로 함께 확인한 뒤에만 한다.
+ *       발행 확인을 기다리는 사이 잠금이 만료돼 다른 릴레이가 같은 항목을 처리했어도 미발행 항목을 지우지 않는다.</li>
  * </ul>
  */
 @Component
@@ -39,6 +45,8 @@ public class OutboxRelay implements SchedulingConfigurer {
     private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
     private static final RedisScript<Long> LOCK =
             RedisScript.of(new ClassPathResource("scripts/lock_acquire_or_extend.lua"), Long.class);
+    private static final RedisScript<Long> ACK =
+            RedisScript.of(new ClassPathResource("scripts/outbox_ack.lua"), Long.class);
 
     private final StringRedisTemplate redis;
     private final KafkaTemplate<String, String> kafkaTemplate;
@@ -69,7 +77,7 @@ public class OutboxRelay implements SchedulingConfigurer {
         }
     }
 
-    /** 한 묶음을 발행하고, 발행 확인된 건수를 돌려준다. */
+    /** 한 묶음을 발행하고, 발행이 확인돼 아웃박스에서 지운 건수를 돌려준다. */
     public int relayOnce() {
         Long locked = redis.execute(LOCK, List.of(RedisKeys.OUTBOX_RELAY_LOCK),
                 instanceId, String.valueOf(properties.lockTtl().toMillis()));
@@ -113,11 +121,40 @@ public class OutboxRelay implements SchedulingConfigurer {
                 break;
             }
         }
-        if (confirmed > 0) {
-            // 릴레이만 앞에서 지우고, 새 항목은 뒤에 붙으므로 LTRIM 이 새 항목을 지우지 않는다.
-            redis.opsForList().trim(RedisKeys.OUTBOX, confirmed, -1);
-            metrics.outboxPublished(confirmed);
+        if (confirmed == 0) {
+            return 0;
         }
-        return confirmed;
+        metrics.outboxPublished(confirmed);
+        return acknowledge(entries.subList(0, confirmed));
+    }
+
+    /**
+     * 발행 확인된 항목을 지운다. 잠금을 여전히 가지고 있고 목록 앞부분이 발행한 항목과 같을 때만, 같은 만큼만 지운다
+     * (발행을 기다리는 사이 잠금이 만료돼 다른 릴레이가 같은 항목을 이미 처리한 경우 미발행 항목을 지우지 않도록).
+     *
+     * @return 지운 항목 수
+     */
+    private int acknowledge(List<String> published) {
+        List<String> args = new ArrayList<>(published.size() + 1);
+        args.add(instanceId);
+        published.forEach(entry -> args.add(sha1Hex(entry)));
+        Long removed = redis.execute(ACK, List.of(RedisKeys.OUTBOX_RELAY_LOCK, RedisKeys.OUTBOX), args.toArray());
+        if (removed == null || removed < 0) {
+            log.warn("발행 확인 전에 릴레이 잠금을 잃어 아웃박스를 지우지 않습니다(다른 릴레이가 다시 발행할 수 있어 중복 가능)");
+            return 0;
+        }
+        if (removed < published.size()) {
+            log.warn("아웃박스 앞부분이 발행한 항목과 달라 {}건 중 {}건만 지웠습니다(다른 릴레이가 먼저 처리)",
+                    published.size(), removed);
+        }
+        return removed.intValue();
+    }
+
+    private static String sha1Hex(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-1").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-1 을 쓸 수 없습니다", e);
+        }
     }
 }
