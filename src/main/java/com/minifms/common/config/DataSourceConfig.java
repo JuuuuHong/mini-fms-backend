@@ -12,7 +12,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.simple.JdbcClient;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.support.JdbcTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -50,9 +50,14 @@ public class DataSourceConfig {
         return JdbcClient.create(rideDataSource);
     }
 
+    /**
+     * JdbcTransactionManager 는 커밋·롤백 중의 SQLException 도 DataAccessException 으로 바꾼다(직렬화 실패 → 재시도 가능 예외 등).
+     * DataSourceTransactionManager 는 모두 TransactionSystemException 으로 감싼다. 연결이 끊겨 커밋 결과를 모르는 경우는
+     * 두 관리자 모두 TransactionSystemException 이 되며, GlobalExceptionHandler 가 503 으로 돌려준다.
+     */
     @Bean
     public PlatformTransactionManager rideTransactionManager(@Qualifier(RIDE_DATA_SOURCE) DataSource rideDataSource) {
-        return new DataSourceTransactionManager(rideDataSource);
+        return new JdbcTransactionManager(rideDataSource);
     }
 
     @Bean

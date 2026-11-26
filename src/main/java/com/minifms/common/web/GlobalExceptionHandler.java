@@ -11,6 +11,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionSystemException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
@@ -66,10 +67,15 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
     /**
      * Redis·ClickHouse·PostgreSQL 연결 실패·시간 초과는 잠시 뒤 다시 시도하면 되는 오류다(503).
-     * 트랜잭션을 시작할 때 DB 연결을 얻지 못하면 DataAccessException 이 아니라 CannotCreateTransactionException 이 난다.
+     * <ul>
+     *   <li>트랜잭션을 시작할 때 DB 연결을 얻지 못하면 DataAccessException 이 아니라 CannotCreateTransactionException 이 난다.</li>
+     *   <li>커밋 중 연결이 끊기면 Spring 이 롤백을 시도하고, HikariCP 가 이미 닫은 연결은 SQLState 없는 예외를 던져
+     *       롤백 실패(TransactionSystemException)가 원래 예외를 덮는다. 커밋됐는지 모르는 상태이므로 재시도를 알린다
+     *       (반납은 멱등이고, 대여 재시도는 이미 커밋됐으면 진행 중인 라이드 ID 를 409 로 돌려받는다).</li>
+     * </ul>
      */
     @ExceptionHandler({DataAccessResourceFailureException.class, TransientDataAccessException.class,
-            CannotCreateTransactionException.class})
+            CannotCreateTransactionException.class, TransactionSystemException.class})
     public ResponseEntity<ProblemDetail> handleStoreUnavailable(RuntimeException e) {
         log.warn("저장소 일시 장애: {}", e.toString());
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)

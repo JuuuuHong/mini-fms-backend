@@ -153,6 +153,12 @@ public class DeviceLockReconciler implements SchedulingConfigurer {
             devices.releaseLockClaim(device.deviceId(), commandId, now.plus(properties.retryMax()));
             log.warn("텔레메트리가 없는 기기라 잠금 명령을 보내지 못했습니다 deviceId={}", device.deviceId());
             return Outcome.WAITING;
+        } catch (RuntimeException e) {
+            // 선점 뒤 보내다 실패했다(Redis 일시 장애 등). 명령이 나갔는지 모르므로 선점은 그대로 두고 다음 확인 때 명령 기록으로
+            // 성패를 본다. 다음 확인은 백오프 뒤로 미룬다 — 바깥 catch 는 스냅샷의 명령 ID(선점 전 null)로 미루려 해 행을 찾지 못한다.
+            log.warn("잠금 명령 발송 실패 deviceId={} commandId={}: {}", device.deviceId(), commandId, e.toString());
+            devices.postponeLockCheck(device.deviceId(), commandId, now.plus(properties.backoff(device.lockAttempts() + 1)));
+            return Outcome.WAITING;
         }
         metrics.deviceLock("REQUESTED");
         log.info("잠금 명령 요청 deviceId={} commandId={} attempt={} status={}", device.deviceId(), commandId,

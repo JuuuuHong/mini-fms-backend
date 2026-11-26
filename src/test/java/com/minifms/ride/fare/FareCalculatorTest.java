@@ -27,6 +27,10 @@ class FareCalculatorTest {
         assertThat(fare(noSubscription, Duration.ofSeconds(1), ZoneType.SERVICE_ZONE).ridingMinutes()).isEqualTo(1);
         assertThat(fare(noSubscription, Duration.ofSeconds(60), ZoneType.SERVICE_ZONE).ridingMinutes()).isEqualTo(1);
         assertThat(fare(noSubscription, Duration.ofSeconds(61), ZoneType.SERVICE_ZONE).ridingMinutes()).isEqualTo(2);
+        assertThat(fare(noSubscription, Duration.ofSeconds(60).plusNanos(400_000), ZoneType.SERVICE_ZONE).ridingMinutes())
+                .as("1분을 0.4ms 넘김 — 밀리초 아래를 버리면 1분이 된다").isEqualTo(2);
+        assertThat(fare(noSubscription, Duration.ofSeconds(60).plusNanos(1_000), ZoneType.SERVICE_ZONE).ridingMinutes())
+                .as("1분을 1µs 넘김(DB 정밀도)").isEqualTo(2);
         assertThat(fare(noSubscription, Duration.ofSeconds(-5), ZoneType.SERVICE_ZONE).ridingMinutes())
                 .as("시계가 거꾸로 가도 음수 요금 없음").isZero();
     }

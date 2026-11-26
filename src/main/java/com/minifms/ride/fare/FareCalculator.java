@@ -29,7 +29,7 @@ import org.springframework.stereotype.Component;
 public class FareCalculator {
 
     private static final Logger log = LoggerFactory.getLogger(FareCalculator.class);
-    private static final long MILLIS_PER_MINUTE = 60_000L;
+    private static final long NANOS_PER_MINUTE = 60_000_000_000L;
 
     private final Pricing pricing;
 
@@ -77,8 +77,8 @@ public class FareCalculator {
         if (zoneType == null || !zoneType.returnable()) {
             throw new IllegalArgumentException("반납할 수 없는 구역의 요금은 계산하지 않습니다: " + zoneType);
         }
-        long millis = Math.max(0L, ridingTime.toMillis());
-        long minutes = (millis + MILLIS_PER_MINUTE - 1) / MILLIS_PER_MINUTE;
+        // 밀리초로 바꾸면 그 아래가 잘려 60.0004초가 1분이 된다. 나노초로 올림한다(약 292년까지 넘치지 않음).
+        long minutes = Math.ceilDiv(Math.max(0L, ridingTime.toNanos()), NANOS_PER_MINUTE);
         long ridingFee = Math.multiplyExact(minutes, tariff.perMinuteFee());
 
         long subscriptionDiscount = (tariff.unlockFeeWaived() ? tariff.unlockFee() : 0)

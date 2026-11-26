@@ -194,6 +194,24 @@ class RideSettlementIT extends RideTestSupport {
     }
 
     @Test
+    void 대여_응답을_잃고_같은_요청을_다시_보내면_진행_중인_라이드_ID_를_돌려준다() throws Exception {
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId); // 커밋됐지만 앱은 응답을 받지 못했다
+
+        // 기기는 이미 IN_USE 지만, 자기 라이드가 있다는 것과 그 ID 를 알려 줘야 반납할 수 있다.
+        rentRequest(userId, deviceId)
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.reason").value("ACTIVE_RIDE_EXISTS"))
+                .andExpect(jsonPath("$.activeRideId").value(rideId.toString()));
+        rentRequest(TestEvents.uniqueId("user"), deviceId)
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.reason").value("DEVICE_NOT_AVAILABLE"));
+        assertThat(rideJdbcClient.sql("SELECT count(*) FROM rides WHERE user_id = :userId")
+                .param("userId", userId).query(Long.class).single()).isEqualTo(1);
+    }
+
+    @Test
     void 대여_규칙과_권한() throws Exception {
         String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
         String other = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);

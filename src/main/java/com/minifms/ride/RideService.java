@@ -20,6 +20,7 @@ import com.minifms.vehicle.location.VehicleSnapshot;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -85,15 +86,17 @@ public class RideService {
         return withDeviceLock(deviceId, () -> {
             Device device = devices.find(deviceId)
                     .orElseThrow(() -> new NotFoundException("등록되지 않은 기기입니다: " + deviceId));
+            // 이용자의 진행 중 라이드를 기기 상태보다 먼저 본다. 대여가 커밋된 뒤 응답을 잃은 앱이 같은 요청을 다시 보내면
+            // 기기는 이미 IN_USE 라, 기기 상태를 먼저 보면 rideId 없는 409 가 나가 이용자가 자기 라이드를 반납할 길이 없다.
+            rides.findActiveRideId(userId).ifPresent(active -> {
+                throw activeRideConflict(active);
+            });
             if (device.state() != DeviceState.AVAILABLE) {
                 throw new ConflictException("이미 대여 중이거나 대여할 수 없는 기기입니다.",
                         Map.of("deviceId", deviceId, "state", device.state().name(), "reason", "DEVICE_NOT_AVAILABLE"));
             }
-            rides.findActiveRideId(userId).ifPresent(active -> {
-                throw activeRideConflict(active);
-            });
 
-            Instant now = clock.instant();
+            Instant now = now();
             // 반납은 단말의 최신 위치로만 판정한다. 지금 위치를 보고하지 않는 기기를 빌려주면 반납할 수 없는 라이드가 생기고
             // 그동안 주행 요금이 쌓이므로, 반납과 같은 신선도 기준을 대여에도 건다.
             freshLocation(deviceId, now, "대여");
@@ -127,7 +130,7 @@ public class RideService {
             if (current.status() == RideStatus.COMPLETED) {
                 return current; // 락을 기다리는 사이 앞선 요청이 확정했다
             }
-            Instant now = clock.instant();
+            Instant now = now();
             VehicleSnapshot location;
             try {
                 location = freshLocation(current.deviceId(), now, "반납");
@@ -189,6 +192,14 @@ public class RideService {
                             "maxLocationAgeSeconds", properties.maxLocationAge().toSeconds()));
         }
         return location;
+    }
+
+    /**
+     * 지금 시각(마이크로초까지). PostgreSQL TIMESTAMPTZ 의 정밀도에 맞춰, 응답·결제 요청에 싣는 시각과 DB 에 저장된 시각이
+     * 같고 저장된 시각으로 요금을 다시 계산해도 같은 분이 나오게 한다(JDK 시계는 나노초까지 줄 수 있다).
+     */
+    private Instant now() {
+        return clock.instant().truncatedTo(ChronoUnit.MICROS);
     }
 
     private <T> T withDeviceLock(String deviceId, Supplier<T> action) {
