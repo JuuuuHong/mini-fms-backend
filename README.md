@@ -2,7 +2,8 @@
 
 차량 관제(FMS, Fleet Management System)와 자율협력주행(C-ITS)용 백엔드 코어 파이프라인.
 텔레매틱스 수집 → 실시간 위치(Redis GEO)·과거 궤적(ClickHouse) 분리 저장, 메시지 멱등 처리, 지오펜스 진입·이탈 감지,
-원격 제어 명령 사가(보상 트랜잭션), C-ITS 돌발상황 전파와 관제 이력 검색(Elasticsearch), JWT 인증을 담았다.
+원격 제어 명령 사가(보상 트랜잭션), C-ITS 돌발상황 전파와 관제 이력 검색(Elasticsearch), JWT 인증,
+지오펜스(다각형) 반납 구역 판정과 라이드 요금 정산(분산 락·결제 요청 트랜잭셔널 아웃박스)을 담았다.
 
 | 영역 | 기술 |
 |---|---|
@@ -11,15 +12,16 @@
 | 실시간 상태 | Redis 7.4 (GEO, Lua 스크립트) |
 | 시계열 | ClickHouse 24.8 (ReplacingMergeTree) |
 | 관제 이력 검색 | Elasticsearch 8.18 (Java API Client, external 버전) |
+| 라이드·정산 | PostgreSQL 17 (Flyway, 결제 요청 아웃박스), Redisson 3.52 (분산 락), JTS 1.20 (다각형·STRtree) |
 | 빌드·테스트 | Gradle(Kotlin DSL), JUnit 5, Testcontainers |
 
 ## 3분 데모
 
-필요한 것: JDK 21, Docker, `jq`. 포트 9092·6379·8123·9200·8080 을 쓴다(이미 쓰는 포트가 있으면 [로컬 실행](#로컬-실행)처럼 바꿔 띄운다).
+필요한 것: JDK 21, Docker, `jq`. 포트 9092·6379·8123·9200·5432·8080 을 쓴다(이미 쓰는 포트가 있으면 [로컬 실행](#로컬-실행)처럼 바꿔 띄운다).
 아래 블록을 순서대로 한 터미널에 붙여 넣으면 된다.
 
 ```bash
-# 0) 인프라(Kafka·Redis·ClickHouse·Elasticsearch) + 앱(시뮬레이터 차량 10대가 1초마다 위치를 보낸다)
+# 0) 인프라(Kafka·Redis·ClickHouse·Elasticsearch·PostgreSQL) + 앱(시뮬레이터 차량 10대가 1초마다 위치를 보낸다)
 docker compose up -d --wait
 ./gradlew bootRun > /tmp/mini-fms.log 2>&1 &
 until curl -sf localhost:8080/actuator/health > /dev/null; do sleep 2; done; sleep 3
@@ -94,6 +96,40 @@ curl -s localhost:8080/api/v1/incidents/$INCIDENT_ID2 -H "$AUTH" | jq -c '{incid
 # {"incidentId":"INC-1795592522-ES","status":"COMPLETED","targetCount":10,"confirmedCount":10}   ← 밀린 결과 색인
 ```
 
+**⑥ 킥보드 대여 → 벌금 구역 반납 → 결제 요청 → 원격 잠금** (PostgreSQL 트랜잭셔널 아웃박스 → Kafka, 명령 사가)
+
+```bash
+# 기기 등록 + 단말 위치 보고(광화문 횡단보도 = 벌금 구역). 위치는 Kafka → Redis 로 비동기 반영된다.
+curl -s -X PUT localhost:8080/api/v1/devices/KB-001 -H "$AUTH" | jq -c '{deviceId, state}'
+# {"deviceId":"KB-001","state":"AVAILABLE"}
+curl -s -o /dev/null -X POST localhost:8080/api/v1/telematics -H "$AUTH" -H 'Content-Type: application/json' \
+  -d "{\"vehicleId\":\"KB-001\",\"latitude\":37.5706,\"longitude\":126.9770,\"speed\":0,\"batterySoc\":71,\"engineStatus\":\"OFF\",\"timestamp\":$(date +%s)000}"
+sleep 2
+
+RIDE=$(curl -s -X POST localhost:8080/api/v1/rides -H "$AUTH" -H 'Content-Type: application/json' -d '{"deviceId":"KB-001"}' | jq -r .rideId)
+curl -s -X POST localhost:8080/api/v1/rides/$RIDE/return -H "$AUTH" | jq -c '{status, zoneType: .returnInfo.zoneType, fare}'
+# {"status":"COMPLETED","zoneType":"PENALTY_ZONE","fare":{"unlockFee":1000,"perMinuteFee":150,"ridingMinutes":1,"ridingFee":150,
+#  "zoneAdjustment":10000,"subscriptionDiscount":0,"total":11150}}
+curl -s localhost:8080/api/v1/devices/KB-001 -H "$AUTH" | jq -c .state     # "LOCKED"     ← 반납 확정, 잠금 확인 전
+sleep 3
+curl -s localhost:8080/api/v1/devices/KB-001 -H "$AUTH" | jq -c .state     # "AVAILABLE"  ← DOOR_LOCK 명령 ACK
+
+docker exec fms-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic ride-payment-requests --from-beginning --timeout-ms 5000 2>/dev/null | grep "$RIDE" | jq -c '{amount, currency, idempotencyKey}'
+# {"amount":11150,"currency":"KRW","idempotencyKey":"ride-payment:ffdbdccf-…"}
+
+# 반납 불가 구역(청계천)으로 옮겨 반납하면 422 이고 라이드는 계속된다.
+RIDE2=$(curl -s -X POST localhost:8080/api/v1/rides -H "$AUTH" -H 'Content-Type: application/json' -d '{"deviceId":"KB-001"}' | jq -r .rideId)
+curl -s -o /dev/null -X POST localhost:8080/api/v1/telematics -H "$AUTH" -H 'Content-Type: application/json' \
+  -d "{\"vehicleId\":\"KB-001\",\"latitude\":37.5690,\"longitude\":126.9850,\"speed\":0,\"batterySoc\":70,\"engineStatus\":\"OFF\",\"timestamp\":$(date +%s)000}"
+sleep 2
+curl -s -X POST localhost:8080/api/v1/rides/$RIDE2/return -H "$AUTH" | jq -c '{status, reason, zoneId}'
+# {"status":422,"reason":"NO_RETURN_ZONE","zoneId":"CHEONGGYECHEON"}
+```
+
+구독권은 `subscriptions` 테이블에 넣는다(판매는 범위 밖):
+`docker exec fms-postgres psql -U fms -d fms -c "INSERT INTO subscriptions (user_id, plan_code, starts_at, ends_at) VALUES ('demo', 'PASS_30', now(), now() + interval '30 days')"`
+
 정리: `kill $(lsof -t -iTCP:8080 -sTCP:LISTEN)` 후 `docker compose down -v`.
 
 ## 목차
@@ -107,20 +143,22 @@ curl -s localhost:8080/api/v1/incidents/$INCIDENT_ID2 -H "$AUTH" | jq -c '{incid
 7. [테스트](#테스트)
 8. [남아 있는 장애 시나리오와 확장 포인트](#남아-있는-장애-시나리오와-확장-포인트)
 9. [후속 요구사항 — 돌발상황 관제 이력](#후속-요구사항--돌발상황-관제-이력)
+10. [후속 요구사항 — 반납 구역 판정과 라이드 요금 정산](#후속-요구사항--반납-구역-판정과-라이드-요금-정산)
 
 ## 디렉터리 구조
 
 ```
 mini-fms-backend
 ├── build.gradle.kts / settings.gradle.kts / gradlew
-├── docker-compose.yml                 # Kafka(KRaft)·Redis·ClickHouse·Elasticsearch (+ app, kafka-ui 프로필)
+├── docker-compose.yml                 # Kafka(KRaft)·Redis·ClickHouse·Elasticsearch·PostgreSQL (+ app, kafka-ui 프로필)
 ├── Dockerfile                         # 멀티 스테이지 빌드
 └── src
     ├── main/java/com/minifms
     │   ├── MiniFmsApplication.java
     │   ├── common
-    │   │   ├── config                 # Kafka 토픽·리스너 팩토리, Clock, @ConfigurationProperties
+    │   │   ├── config                 # Kafka 토픽·리스너 팩토리, DataSource 2개(ClickHouse·PostgreSQL), Redisson, Clock, @ConfigurationProperties
     │   │   ├── idempotency            # IdempotencyGuard: Redis 2단계(선점→완료) 멱등 처리
+    │   │   ├── lock                   # DistributedLock: Redisson RLock(watchdog) 래퍼
     │   │   ├── outbox                 # Redis 아웃박스 → Kafka 릴레이
     │   │   ├── kafka · redis · geo · metrics · web(ProblemDetail 오류 응답)
     │   ├── telematics
@@ -133,11 +171,18 @@ mini-fms-backend
     │   ├── command                    # 원격 제어 사가: API, 저장소(Lua), ACK 소비자, 타임아웃 스케줄러
     │   ├── incident                   # C-ITS 돌발상황: 반경 2km 경고 브로드캐스트, 처리 결과 기록
     │   │   └── history                # Elasticsearch 색인 소비자·저장소·검색 서비스
+    │   ├── ride                       # 대여·반납 오케스트레이션(RideService), 라이드 트랜잭션, 저장소
+    │   │   ├── zone                   # 반납 구역 판정(JTS 다각형 + STRtree)
+    │   │   ├── fare                   # 요금 계산(요금표 스냅샷·구독권·구역 조정)
+    │   │   ├── device                 # 기기 상태 머신, 반납 뒤 원격 잠금 조정기
+    │   │   ├── payment                # 결제 요청 아웃박스(PostgreSQL) → Kafka 릴레이
+    │   │   └── api                    # /api/v1/rides, /api/v1/devices
     │   ├── security                   # JWT 검증 필터 체인, scope, 개발용 토큰 발급
     │   └── simulator                  # 가상 차량 10대(텔레메트리) + 가상 TCU(명령 응답)
     ├── main/resources
     │   ├── application.yml / application-local.yml
     │   ├── clickhouse/schema.sql
+    │   ├── db/migration/*.sql         # PostgreSQL 스키마(Flyway): 기기·라이드·구독권·결제 아웃박스
     │   └── scripts/*.lua              # 원자적 상태 변경 10개
     └── test
         ├── java/com/minifms           # Testcontainers 통합 테스트 + 단위 테스트
@@ -152,6 +197,7 @@ flowchart LR
         SIM["가상 차량 10대<br/>1초 주기 텔레메트리"]
         TCU["가상 TCU<br/>명령 응답"]
         RSU["RSU·도로 센서"]
+        RIDER["이용자 앱"]
     end
 
     subgraph App["Mini FMS Backend"]
@@ -165,6 +211,9 @@ flowchart LR
         IDX["IncidentResultIndexer<br/>group: fms-incident-indexer"]
         RELAY["OutboxRelay"]
         Q["조회 API"]
+        RIDE["RideService<br/>(기기 락·구역 판정·요금)"]
+        PREL["PaymentOutboxRelay"]
+        LREC["DeviceLockReconciler"]
     end
 
     subgraph Kafka
@@ -176,11 +225,13 @@ flowchart LR
         COMP[(vehicle-command-compensations)]
         IA[(c-its-incident-alerts)]
         IR[(c-its-incident-results)]
+        PAY[(ride-payment-requests)]
     end
 
-    REDIS[("Redis<br/>GEO·최신 상태·지오펜스·멱등키<br/>명령 상태·아웃박스")]
+    REDIS[("Redis<br/>GEO·최신 상태·지오펜스·멱등키<br/>명령 상태·아웃박스·분산 락")]
     CH[("ClickHouse<br/>telematics_history")]
     ES[("Elasticsearch<br/>c-its-incidents")]
+    PG[("PostgreSQL<br/>기기·라이드·구독권<br/>결제 아웃박스")]
 
     SIM --> ING --> RAW
     RAW --> RT
@@ -205,11 +256,19 @@ flowchart LR
     Q --> REDIS
     Q --> CH
     Q --> ES
+    RIDER --> SEC --> RIDE
+    RIDE -->|"기기 락(Redisson) · 단말 최신 위치"| REDIS
+    RIDE -->|"TX: 라이드 확정 · 기기 LOCKED · 결제 요청 적재"| PG
+    PREL -->|"FOR UPDATE SKIP LOCKED"| PG
+    PREL --> PAY
+    LREC -->|"LOCKED 기기 → AVAILABLE"| PG
+    LREC -->|"DOOR_LOCK 요청"| CMD
 ```
 
 - **수집 경로는 가볍게**: API·시뮬레이터는 검증만 하고 `telematics-raw-events` 에 싣는다(키 = vehicleId → 같은 차량은 같은 파티션에서 순서 유지).
 - **소비처별 consumer group**: 실시간(Redis)·이력(ClickHouse)·관제 이력 색인(Elasticsearch)이 서로 다른 group 이다. 저장소 하나의 장애가 다른 경로를 막지 않는다.
 - **조회는 CQRS 의 조회 측**: 현재 상태는 Redis, 과거 궤적은 ClickHouse, 돌발상황 이력은 Elasticsearch 에서 읽는다.
+- **돈이 걸린 상태는 PostgreSQL**: 기기 상태 전이·라이드 확정·결제 요청 적재는 한 ACID 트랜잭션이어야 해서 관계형 DB 에 둔다.
 
 ## 핵심 설계
 
@@ -401,12 +460,119 @@ sequenceDiagram
 | scope | 허용 |
 |---|---|
 | `fleet:read` | `GET /api/v1/**`(관제 이력 검색 포함), `/actuator/**`(health·info 제외) |
-| `vehicle:control` | `POST /api/v1/vehicles/{id}/commands` |
+| `vehicle:control` | `POST /api/v1/vehicles/{id}/commands`, `PUT /api/v1/devices/{id}` |
 | `telematics:write` | `POST /api/v1/telematics[/batch]` |
 | `incident:write` | `POST /api/v1/incidents` |
+| `ride:write` | `POST /api/v1/rides`, `POST /api/v1/rides/{id}/return`, 본인 `GET /api/v1/rides/{id}` |
 
 - 토큰 없음·서명 불일치·만료·`exp` 없음(영구 토큰)·발급자 불일치 → **401**, scope 부족 → **403**, 그 밖의 경로는 거부(deny by default).
 - 서명 키는 `FMS_JWT_SECRET`(32바이트 이상). 비어 있으면 **기동하지 않는다**. `local` 프로필만 개발용 키와 토큰 발급 API 를 켠다.
+
+### 8. 라이드 반납·정산 — 구역 판정, 분산 락, 결제 요청 아웃박스
+
+```mermaid
+stateDiagram-v2
+    [*] --> AVAILABLE: PUT /devices/{id}
+    AVAILABLE --> IN_USE: 대여(CAS)
+    IN_USE --> LOCKED: 반납 확정(라이드 COMPLETED·결제 요청 적재와 한 트랜잭션)
+    LOCKED --> AVAILABLE: DOOR_LOCK 명령 ACK
+    LOCKED --> LOCKED: 잠금 거절·무응답 → 백오프 뒤 다시 요청
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 이용자 앱
+    participant S as RideService
+    participant R as Redis
+    participant DB as PostgreSQL
+    participant RL as PaymentOutboxRelay
+    participant K as Kafka
+    participant RC as DeviceLockReconciler
+
+    U->>S: POST /api/v1/rides/{id}/return
+    S->>R: 기기 락 fms:lock:device:{id} (최대 3초 대기, watchdog 연장)
+    S->>R: 단말 최신 위치(측정 30초 이내)
+    S->>S: 구역 판정(STRtree → 다각형) · 요금 계산
+    S->>DB: TX{ 라이드 IN_PROGRESS→COMPLETED · 기기 IN_USE→LOCKED · payment_outbox INSERT }
+    S-->>U: 200 확정 요금 (락 해제)
+    loop 200ms
+        RL->>DB: 미발행 행 FOR UPDATE SKIP LOCKED
+        RL->>K: ride-payment-requests (acks=all, 키 = rideId)
+        RL->>DB: 확인된 행 published_at · COMMIT
+    end
+    loop 500ms
+        RC->>DB: 차례가 된 LOCKED 기기
+        RC->>R: DOOR_LOCK 명령(기존 명령 사가)
+        RC->>DB: ACKNOWLEDGED 면 LOCKED → AVAILABLE
+    end
+```
+
+**구역 판정** (`ReturnZoneIndex`)
+
+- 구역은 WKT 다각형(`POLYGON`·`MULTIPOLYGON`, "경도 위도" 순서)으로 설정한다. 기동할 때 읽어 **STRtree**(경계 사각형 R-tree)에 넣고,
+  판정은 "좌표를 포함할 수 있는 후보(사각형) → 실제 다각형 포함 검사" 두 단계로 한다. 구역이 많아져도 후보만 정밀 검사한다.
+- 겹친 구역은 **더 제한적인 정책 하나**: `NO_RETURN_ZONE > PENALTY_ZONE > DISCOUNT_ZONE > SERVICE_ZONE`(같은 정책끼리는 ID 순).
+  어느 구역에도 속하지 않으면 서비스 지역 밖이라 반납을 받지 않는다.
+- **경계 위의 점은 구역 안**이다. 좌표는 경도·위도를 평면 좌표로 쓴다(도시 규모에서 측지선과의 차이는 GPS 오차보다 훨씬 작다).
+- 자기 교차 다각형, 다각형이 아닌 도형, 중복 ID, **위도·경도를 뒤바꾼 WKT**(위도 범위를 벗어남)는 기동할 때 거부한다.
+- Uber H3 육각 셀 근사는 쓰지 않았다. 셀 경계가 실제 구역 경계와 달라, 구역 밖에 세운 이용자에게 10,000원 벌금을 매길 수 있기 때문이다.
+- **판정 좌표는 요청 본문이 아니라 단말이 보낸 최신 텔레메트리**(Redis)다. 클라이언트가 좌표를 꾸밀 수 없다. 측정 시각이 30초(`fms.ride.max-location-age`)보다
+  오래됐거나 위치가 없으면 반납을 받지 않는다(422, 잠시 뒤 재시도).
+- 같은 기준을 **대여에도** 건다. 위치를 보고하지 않는 기기를 빌려주면 반납할 수 없는 라이드가 생기고 그동안 주행 요금이 쌓이기 때문이다
+  (단말은 대여 가능 상태에서도 30초 안에 위치를 보고한다고 가정한다).
+
+**요금** (`FareCalculator`, 원 단위 정수)
+
+```
+합계 = 잠금해제료 + 주행시간(분, 시작한 분 올림) × 분당요금 + 구역 조정 − 구독권 할인
+구역 조정   = 벌금 구역 +10,000 | 주차 권장 구역 −500(남은 금액까지만) | 서비스 구역 0
+구독권 할인 = (잠금해제료 면제면 잠금해제료) + 주행요금 × 할인율 / 100   (원 미만 버림)
+```
+
+- 잠금해제료·분당요금·구독권은 **대여할 때 라이드에 스냅샷**으로 남겨 반납 때 그 값으로 정산한다. 이용 중에 요금표가 바뀌거나 구독권이 끝나도 대여할 때의 조건을 지킨다.
+  구역 할인·벌금은 반납 시점의 설정을 쓴다.
+- 구독권은 이용요금(잠금해제료 + 주행요금)만 깎고 **벌금은 깎지 않는다**. 주차 권장 할인은 남은 금액보다 크면 남은 금액까지만 적용한다(합계 ≥ 0, 환불을 만들지 않음).
+- 항목의 합이 합계와 같다는 것을 `Fare` 생성자와 DB `CHECK` 가 함께 지킨다.
+
+**동시성 — 분산 락은 1차, DB 가 최종**
+
+- 같은 기기에 대한 대여·반납은 Redisson 락 `fms:lock:device:{deviceId}` 로 줄 세운다. 임대 시간을 주지 않아 **watchdog 이 보유 중 연장**하고,
+  프로세스가 죽으면 30초 뒤 풀린다. `lock-wait`(3초) 안에 얻지 못하면 409(`REQUEST_IN_PROGRESS`).
+- redisson-spring-boot-starter 는 쓰지 않았다. 스타터는 `RedisConnectionFactory` 를 Redisson 구현으로 바꿔 기존 Lettuce 기반 Lua 스크립트와 예외 변환(503 판정)까지 바꾼다.
+  락에 필요한 `RedissonClient` 만 `spring.data.redis` 설정으로 따로 만든다.
+- **락은 정합성을 보장하지 않는다**: 긴 GC 정지나 Redis 장애 조치로 락이 풀린 사이 다른 인스턴스가 들어올 수 있다. 그래서 상태 전이는 모두 조건부 갱신이다.
+  - `UPDATE devices … WHERE state = 'AVAILABLE'`, `UPDATE rides … WHERE status = 'IN_PROGRESS'`, `UPDATE devices … WHERE state = 'IN_USE' AND current_ride_id = ?`
+  - 부분 유니크 인덱스: 기기당·사용자당 `IN_PROGRESS` 라이드 하나, `payment_outbox.ride_id` 유니크(라이드당 결제 요청 하나)
+  - 회귀 테스트 `RideConcurrencyIT`: 락 없이 반납 트랜잭션 16건 동시 → 확정 1건·결제 요청 1건.
+- **반납은 멱등**: 이미 확정된 라이드는 저장된 결과를 그대로 돌려준다(중복 클릭·재시도에도 결제 요청은 한 건).
+- 같은 사용자가 서로 다른 기기를 동시에 빌리면 기기 락이 달라 함께 통과하지만, 사용자 유니크 인덱스가 하나만 받는다(나머지 409 `ACTIVE_RIDE_EXISTS`).
+
+**결제 요청 — 트랜잭셔널 아웃박스** (`PaymentOutboxRelay`)
+
+- 반납 API 는 외부 결제 API 를 부르지도, Kafka 에 직접 보내지도 않는다. 라이드 확정과 `payment_outbox` INSERT 가 **한 트랜잭션**이라
+  "요금은 확정됐는데 결제 요청이 없음"·"결제 요청은 나갔는데 라이드는 롤백됨"이 생기지 않는다. Kafka 가 멈춰도 반납은 성공하고, 결제 요청은 복구 뒤 나간다.
+- 릴레이 한 주기 = 한 트랜잭션: 미발행 행을 `FOR UPDATE SKIP LOCKED` 로 잠가 모두 보낸 뒤, 브로커 확인(acks=all)이 온 행만 `published_at` 을 찍고 커밋한다.
+  여러 인스턴스가 함께 돌아도 잠긴 행은 서로 건너뛰므로 같은 행을 동시에 보내지 않는다(별도 잠금 불필요).
+- at-least-once: 보낸 뒤 확인 전에 죽으면 롤백돼 다시 보낸다. 결제 서비스는 `idempotencyKey`(`ride-payment:{rideId}`, PG 멱등키로 그대로 쓸 수 있다)로 중복 청구를 막는다.
+- 확인된 행은 7일 뒤 지운다(`fms.payment-outbox.retention`).
+- Kafka 를 택한 이유: 이미 쓰는 브로커이고, 키(rideId) 단위 보존·재처리가 된다. SQS 로 바꾸려면 릴레이의 send 만 바꾸면 된다.
+
+**반납 뒤 원격 잠금** (`DeviceLockReconciler`)
+
+- 반납 트랜잭션은 기기를 `LOCKED` 로 바꾸기만 한다. 조정기가 주기마다 차례가 된 `LOCKED` 기기에 기존 명령 사가로 `DOOR_LOCK` 을 보내고,
+  `ACKNOWLEDGED` 면 `AVAILABLE` 로 돌린다. 할 일을 DB 의 기기 상태로 들고 있어, 반납 직후 프로세스가 죽거나 Redis 가 잠시 멈춰도 다음 주기에 이어서 한다.
+- 거절·무응답(`FAILED`·`TIMEOUT`)이면 명령을 비우고 지수 백오프(5초에서 두 배씩, 최대 5분) 뒤 다시 보낸다. 그동안 기기는 `LOCKED` — **잠김이 확인되지 않은 기기는 빌려주지 않는다**.
+- **선점 후 발송**: 명령 ID 를 먼저 만들어 기기 행에 조건부로 기록(`LOCKED` 이고 진행 중 명령 없음)한 뒤에 보낸다. 주기 시작 때 읽은 목록은 스냅샷이라,
+  조정기 락을 잃은 사이 다른 조정기가 그 기기를 잠금 확인 → 대여(`IN_USE`)까지 진행했을 수 있다. 선점이 실패하면 보내지 않아 **주행 중인 기기를 잠그지 않는다**.
+  선점 뒤 발송 전에 죽으면 명령 기록이 없으므로 다음 확인 때 실패로 보고 다시 보낸다.
+- 다른 명령(관제의 `ENGINE_STOP` 등)이 진행 중이면(409) 선점을 풀고 끝나기를 기다렸다 보낸다.
+- 명령 전송 확인이 오지 않으면(브로커 장애 추정) 그 주기의 남은 기기는 다음 주기로 넘긴다. 기기마다 전송 대기(최대 3초)로 스케줄러 스레드를 오래 붙잡지 않기 위해서다.
+  같은 이유로 스케줄러 풀을 8개로 늘렸다(브로커 장애 때 막히는 작업이 스레드를 다 잡아도 Redis 만 쓰는 명령 타임아웃 보상은 돈다).
+
+**장애 격리**: `db` 헬스는 ClickHouse 만 본다. 라이드 DB 장애로 앱 전체가 트래픽에서 빠지면 텔레매틱스 수집·돌발상황 경고까지 멈추기 때문이다.
+떠 있는 인스턴스에서 라이드 DB·Redis 연결 실패는 라이드 API 의 503(`Retry-After`)으로만 드러난다. Redisson 은 첫 사용 때 연결한다(지연 초기화).
+단, **기동 때는 Flyway 마이그레이션이 PostgreSQL 연결을 요구**하므로 PostgreSQL 이 멈춘 동안 재기동한 인스턴스는 뜨지 않는다(ClickHouse 스키마 초기화와 같은 성질).
 
 ## 데이터 모델
 
@@ -422,6 +588,7 @@ sequenceDiagram
 | `vehicle-command-compensations` | vehicleId | 아웃박스 릴레이 → (고객 앱 푸시·감사 로그) | 7일 |
 | `c-its-incident-alerts` | vehicleId | 돌발상황 서비스 → (V2X 푸시 게이트웨이) | 1일 |
 | `c-its-incident-results` | incidentId | 아웃박스 릴레이 → 이력 색인 소비자 | 7일 |
+| `ride-payment-requests` | rideId | 결제 요청 아웃박스 릴레이 → (결제 서비스) | 7일 |
 
 ### Redis 키
 
@@ -438,6 +605,17 @@ sequenceDiagram
 | `fms:incident:{id}:result-version` | string | 돌발상황 처리 결과의 마지막 버전(TTL 30일) |
 | `fms:dedup:{namespace}:{key}` | string | 멱등키(토큰 또는 DONE) |
 | `fms:outbox` / `fms:outbox:dead` | list | 발행 대기 이벤트 / 해석 불가 항목 |
+| `fms:lock:device:{id}` | hash(Redisson) | 기기 대여·반납 분산 락(watchdog 30초) |
+| `fms:lock:device-lock-reconciler` | hash(Redisson) | 잠금 조정기를 한 인스턴스만 돌리는 락 |
+
+### PostgreSQL (Flyway `db/migration/V1__ride_settlement.sql`)
+
+| 테이블 | 내용 | 지키는 것 |
+|---|---|---|
+| `devices` | 기기 상태(`AVAILABLE`·`IN_USE`·`LOCKED`), 진행 중 라이드, 잠금 명령 진행(명령 ID·시도 수·다음 확인 시각) | `IN_USE` ⇔ 진행 중 라이드 있음 |
+| `rides` | 대여 시점 요금표·구독권 스냅샷, 반납 위치·측정 시각·구역, 요금 항목·합계 | 기기당·사용자당 `IN_PROGRESS` 하나(부분 유니크), 항목 합 = 합계 |
+| `subscriptions` | 구독권(사용자·코드·기간). 판매·결제는 범위 밖, 읽기만 한다 | `ends_at > starts_at` |
+| `payment_outbox` | 결제 요청(JSON), 토픽·키, 발행 확인 시각 | 라이드당 한 건(`ride_id` 유니크) |
 
 ### ClickHouse
 
@@ -487,6 +665,11 @@ TTL toDateTime(event_time) + INTERVAL 90 DAY;
 | `POST /api/v1/incidents` | `incident:write` | 돌발상황 보고 → 반경 2km 경고 전파 | 202 `{incidentId, duplicate, recipients, vehicleIds}`, 409(처리 중·선점 만료), 503(발행 미확인·저장소 장애) |
 | `GET /api/v1/incidents?from&to[&type&page&size]` | `fleet:read` | 관제 이력 검색(발생 `[from,to)`, 최신순) | 200 `{content, page, size, totalElements, totalPages}`, 400, 503 |
 | `GET /api/v1/incidents/{incidentId}` | `fleet:read` | 돌발상황 처리 결과 | 200, 404(색인 전), 503 |
+| `PUT /api/v1/devices/{deviceId}` | `vehicle:control` | 대여 기기 등록(ID = 텔레매틱스 vehicleId, 멱등) | 201(새로), 200(이미 있음) |
+| `GET /api/v1/devices/{deviceId}` | `fleet:read` | 기기 상태·잠금 진행 | 200, 404 |
+| `POST /api/v1/rides` `{deviceId}` | `ride:write` | 대여(이용자 = 토큰 subject) | 201 + Location, 404(미등록), 409(`DEVICE_NOT_AVAILABLE`·`ACTIVE_RIDE_EXISTS`·`REQUEST_IN_PROGRESS`), 422(`LOCATION_STALE`·`LOCATION_UNAVAILABLE`) |
+| `POST /api/v1/rides/{rideId}/return` | `ride:write` | 반납: 구역 판정·요금 확정·결제 요청 적재(멱등) | 200, 404(남의 라이드 포함), 409, 422(`NO_RETURN_ZONE`·`OUT_OF_SERVICE_AREA`·`LOCATION_STALE`·`LOCATION_UNAVAILABLE`), 503 |
+| `GET /api/v1/rides/{rideId}` | `ride:write`(본인) · `fleet:read`(전체) | 라이드·요금 | 200, 404 |
 | `POST /api/v1/auth/dev-token` | 없음(`local` 프로필만) | 개발용 토큰 발급 | 200 |
 | `GET /actuator/health` | 없음 | 헬스 체크(Elasticsearch 제외) | 200 |
 | `GET /actuator/metrics/{name}` | `fleet:read` | 지표 | 200 |
@@ -523,7 +706,7 @@ docker compose up -d --wait   # Kafka·Redis·ClickHouse·Elasticsearch
 ```
 
 - 포트가 이미 쓰이고 있으면 바꿔 띄운다: `REDIS_PORT=6380 docker compose up -d --wait` 후 `REDIS_PORT=6380 ./gradlew bootRun`
-  (`KAFKA_PORT`, `CLICKHOUSE_PORT`, `ELASTICSEARCH_PORT`, `APP_PORT` 도 같다. Elasticsearch 는 `ELASTICSEARCH_URIS=http://localhost:<포트>` 도 함께 준다).
+  (`KAFKA_PORT`, `CLICKHOUSE_PORT`, `ELASTICSEARCH_PORT`, `POSTGRES_PORT`, `APP_PORT` 도 같다. Elasticsearch 는 `ELASTICSEARCH_URIS=http://localhost:<포트>` 도 함께 준다).
 - 앱까지 컨테이너로: `docker compose --profile app up -d --build`
 - Kafka UI: `docker compose --profile tools up -d kafka-ui` → http://localhost:8090
 - 시뮬레이터 끄기: `FMS_SIMULATOR_ENABLED=false ./gradlew bootRun`
@@ -574,7 +757,7 @@ curl -s "localhost:8080/actuator/metrics/fms.incident.history.indexed" -H "$AUTH
 ./gradlew test
 ```
 
-Testcontainers 가 Kafka·Redis·ClickHouse·Elasticsearch 를 한 번 띄우고 모든 통합 테스트가 같은 Spring 컨텍스트를 쓴다(Docker 필요, 약 1분 10초).
+Testcontainers 가 Kafka·Redis·ClickHouse·Elasticsearch·PostgreSQL 을 한 번 띄우고 모든 통합 테스트가 같은 Spring 컨텍스트를 쓴다(Docker 필요, 약 1분 10초).
 
 | 테스트 | 확인하는 것 |
 |---|---|
@@ -591,7 +774,12 @@ Testcontainers 가 Kafka·Redis·ClickHouse·Elasticsearch 를 한 번 띄우고
 | `IncidentResilienceIT` | **브로커 장애 → 발행 1회로 멈춤·FAILED 5/0/5**, **처리 중 선점을 잃으면 409·결과 미기록**, 대상 상한은 시동 꺼짐 제외 뒤 적용 |
 | `IncidentHistoryIT` | 기간·유형 필터, 최신순·같은 시각 incidentId 순·페이지, 401·403·400(page 오버플로 포함), 대상 0대(NO_TARGETS), 일부 발행 실패(PARTIALLY_FAILED 3/2/1) → 재시도 결과가 이력 대체, **Elasticsearch 15초 정지 중 접수·경고 계속·검색 503·색인 없음 → 복구 후 이력 조회**, 재전달·늦은 이전 결과가 최신을 덮지 않음, **운영 중 색인 삭제 → strict 매핑으로 재생성** |
 | `SecurityIT` | 토큰 없음·만료·위조 서명·다른 발급자·**exp 없음** 401, scope 부족 403, 수집·돌발상황 API 는 전용 scope 만, 헬스 공개 |
+| `RideSettlementIT` | **벌금 구역 반납 → 11분·12,650원 → 결제 요청 Kafka 1건(멱등키) → DOOR_LOCK ACK → AVAILABLE → 재대여**, 주차 권장 구역 + 구독권(대여 뒤 만료돼도 대여 시점 조건) 1,025원, 반납 불가 구역 422·라이드 유지·결제 요청 없음 → 옮긴 뒤 반납, 서비스 지역 밖·대여 뒤 보고 끊김(2분 전) 반납 422, 위치 없음·오래된 기기 대여 422, 반납 재요청 같은 응답·결제 요청 1건, 대여 규칙(대여 중·이용 중·미등록 409/404)·남의 라이드 404·scope 403, **잠금 무응답 기기는 LOCKED 유지·재시도·대여 409** |
+| `RideConcurrencyIT` | 같은 기기 동시 대여 16건 → 1건, 같은 라이드 동시 반납 16건 → 같은 요금·결제 요청 1건, **락 없이 반납 트랜잭션 16건 동시 → 확정 1건**, **락 없이 같은 기기 대여 트랜잭션 동시 → 1건**, 같은 사용자 다른 기기 16대 동시 → 1건(나머지 `ACTIVE_RIDE_EXISTS`), 다른 요청이 락을 쥐면 1초 기다린 뒤 409 |
+| `PaymentOutboxRelayIT` | 확인된 행만 표시하고 실패한 행만 다시 보냄, send 즉시 실패 시 중단·앞선 것만 표시, 확인 마감 초과 시 표시 안 함, **두 릴레이 동시 → 잠긴 행은 건너뜀(같은 행 동시 발행 없음)**, 보존 기간 지난 발행 행만 삭제 |
 | `GeoDistanceTest`, `SimulatedFleetTest`, `IncidentDispatchStatusTest` | 거리 계산, 시뮬레이터 경로가 지오펜스 경계를 넘나듦, 처리 상태 판정 |
+| `DeviceLockReconcilerTest` | **기기 행 선점에 실패하면(스냅샷 뒤 상태 변경) 잠금 명령을 보내지 않음**, 선점한 ID 로 발송, 전송 확인이 없으면 남은 기기는 다음 주기로, 다른 명령 진행 중이면 선점 해제 |
+| `ReturnZoneIndexTest`, `FareCalculatorTest` | 구역 우선순위(겹침)·경계 포함·서비스 지역 밖·잘못된 WKT(뒤바뀐 위경도·자기 교차·중복 ID) 거부, 분 올림·구독권(면제·할인율·원 미만 버림)·벌금 비할인·할인 상한·잠금 재시도 백오프 |
 
 주요 테스트는 고친 코드를 일부러 되돌려(변이) 실패하는지 확인했다: 결과 모름도 즉시 보상, CAS 깨기, 날짜별 확정 제거,
 결과 기록의 선점 확인 제거, `require_alias` 제거, Elasticsearch external 버전 제거.
@@ -622,6 +810,25 @@ Testcontainers 가 Kafka·Redis·ClickHouse·Elasticsearch 를 한 번 띄우고
 - **부분 실패 재시도**: 이미 경고를 받은 차량에 같은 경고가 다시 간다. 단말이 `incidentId` 로 중복 표시를 걸러야 한다.
 - **발행 확인 = 마감 안의 브로커 수신**: 확인이 3초보다 늦으면 실제로 전달됐어도 실패로 세고 재전파된다. 차량 단말이 실제로 받았는지는 연동 범위 밖이다.
 - **깊은 페이지**: `page × size ≤ 10,000`. 그 이상은 기간을 좁히거나 `search_after` 커서로 바꾼다.
+
+**라이드 반납·정산**
+
+- **GPS 오차와 구역 경계**: 경계에 닿으면 구역 안으로 본다. 벌금 구역 경계 몇 m 안에서는 GPS 오차(수~수십 m)에 따라 판정이 갈릴 수 있다.
+  단말이 위치 정확도(HDOP 등)를 보내면 "불확실하면 벌금 대신 사진 확인 요청" 같은 완충 규칙을 더할 수 있다(지금 텔레메트리에는 정확도가 없다).
+- **위치 신선도는 단말 시각 기준**: 측정 시각이 30초 안이면 받는다. 단말 시계가 앞서 있으면(최대 30초 허용) 실제보다 신선하게 보인다.
+- **대여 때 잠금 해제 명령은 보내지 않는다**(요구 범위 밖): 대여는 상태만 바꾼다. 실제 서비스는 `DOOR_UNLOCK` 명령과, 실패하면 대여를 취소(무료)하는 보상이 필요하다.
+- **잠금이 끝내 확인되지 않는 기기**: `LOCKED` 로 남아 최대 5분 간격으로 계속 다시 보낸다(대여 불가). 물리적으로 잠기지 않은 채 세워져 있을 수 있으므로
+  `fms.ride.device_lock{result=FAILED}` 증가에 경보를 걸어 현장 확인해야 한다. 늦게 온 성공 ACK(TIMEOUT 확정 뒤)는 명령 사가와 같이 자동 보정하지 않는다.
+- **결제 결과는 범위 밖**: 결제 실패·미수금·환불·분쟁은 결제 서비스가 한다. 이 서비스는 확정 요금과 결제 요청 발행까지 책임진다.
+- **결제 요청 중복 가능**(at-least-once): 결제 서비스가 `idempotencyKey` 로 거르지 않으면 이중 청구된다. 이 계약을 결제 서비스와 맞춰야 한다.
+- **릴레이 트랜잭션이 브로커 확인을 기다리는 동안**(최대 5초) 행 잠금과 DB 연결 하나를 쥔다. 브로커 장애가 길면 주기마다 그만큼 연결을 붙잡는다.
+- **구역·요금표는 설정 파일**: 바꾸려면 재기동한다. 라이드에는 구역 ID·정책만 남고 구역 다각형의 변경 이력은 없다(분쟁 시 당시 구역 모양을 복원할 수 없다).
+- **구독권이 여럿이면** 잠금해제료 면제를 먼저, 그다음 할인율이 큰 것 하나만 쓴다(대여 시점에는 주행 시간을 몰라 어느 쪽이 유리한지 알 수 없다).
+- **주행 중 단말 통신이 끊기면 반납할 수 없다**: 반납은 30초 안의 단말 위치가 있어야 받는다. 통신이 돌아올 때까지 라이드가 진행 중으로 남고 주행 요금이 쌓인다.
+  종료 정책(마지막 보고 시각을 종료 시각으로 쓰기, 관제의 강제 종료 API 등)은 정하지 않았다.
+- **Redis 장애**: 분산 락과 단말 위치가 모두 Redis 라 대여·반납이 503 이다(락만 건너뛰어도 DB 가 정합성은 지키지만, 위치 없이는 반납 판정을 할 수 없다).
+- **PostgreSQL 장애**: 라이드 API 503, 결제 요청 릴레이·잠금 조정 정지. 떠 있는 인스턴스의 수집·명령·돌발상황 경로는 영향 없다(헬스에서 제외).
+  하지만 장애 중 재기동·확장한 인스턴스는 Flyway 마이그레이션에서 기동이 실패한다. 마이그레이션을 배포 잡으로 분리하면(`spring.flyway.enabled=false`) 이 의존을 없앨 수 있다.
 
 **공통**
 
@@ -654,3 +861,25 @@ Testcontainers 가 Kafka·Redis·ClickHouse·Elasticsearch 를 한 번 띄우고
 | 1. 서로 다른 시각과 유형으로 접수한 보고 중 기간과 유형 조건을 충족하는 이력만 최신순으로 조회된다. 조회 권한이 없는 토큰은 `403`을 받는다. | `IncidentHistoryIT` — 기간 밖 2건 제외, 유형 필터, 같은 시각 2건은 incidentId 순, 페이지 2개, `incident:write`·`telematics:write`·`vehicle:control` 토큰 403 |
 | 2. 수신 대상이 0대인 보고와 일부 발행에 실패한 보고에서 각각 대상 수, 발행 확인 건수, 처리 상태를 확인할 수 있다. | `IncidentHistoryIT` — `NO_TARGETS` 0/0/0, `PARTIALLY_FAILED` 대상 3·확인 2·실패 1 → 재시도 뒤 `COMPLETED` 3/3 |
 | 3. Elasticsearch 중단 중에도 경고가 Kafka에 발행된다. 복구 후 해당 이력을 찾을 수 있고, 같은 처리 결과를 재전달해도 검색 결과에는 한 건만 나타난다. | `IncidentHistoryIT` — 컨테이너 15초 일시 정지 중 접수 202·경고 2건 발행·검색 503·색인 없음 → 재개 후 이력 조회, 재전달·늦은 도착 뒤에도 문서 1건·최신 버전 유지 |
+
+## 후속 요구사항 — 반납 구역 판정과 라이드 요금 정산
+
+구현 완료(2026-11-26). 설계는 [핵심 설계 8](#8-라이드-반납정산--구역-판정-분산-락-결제-요청-아웃박스), 데모는 [3분 데모 ⑥](#3분-데모)에 있다.
+
+| 항목 | 요구사항 | 구현 |
+|---|---|---|
+| 구역 정책 판정 | `SERVICE_ZONE`(정상), `DISCOUNT_ZONE`(주차 권장 −500원), `PENALTY_ZONE`(주차 금지 +10,000원), `NO_RETURN_ZONE`(반납 불가). 반납 시 기기의 최종 GPS 좌표가 속한 다각형을 판정 | JTS 다각형 + STRtree. 좌표는 단말 최신 텔레메트리(30초 이내). 겹치면 더 제한적인 정책, 어느 구역에도 없으면 반납 불가 |
+| 상태 머신 | `AVAILABLE → IN_USE → LOCKED`(원격 잠금 명령) | DB 조건부 갱신. `LOCKED` 에서 기존 명령 사가로 `DOOR_LOCK`, ACK 면 `AVAILABLE` |
+| 동시성 | Redisson 분산 락으로 중복 반납·동시 대여 경합 차단 | 기기 단위 락(watchdog) + DB 조건부 갱신·부분 유니크 인덱스(락을 잃어도 한 번) + 멱등 반납 |
+| 요금 | 잠금해제료 + 주행시간(분) × 분당요금 + 구역 벌금/할인 − 구독권 할인 | 분 올림, 대여 시점 요금표·구독권 스냅샷, 구독권은 벌금 비할인, 합계 ≥ 0 |
+| 결제 요청 | 외부 API 를 바로 부르지 않고 트랜잭셔널 아웃박스로 DB 에 저장 후 Kafka/SQS 로 비동기 릴레이 | 반납 확정과 같은 트랜잭션에 `payment_outbox` INSERT → `FOR UPDATE SKIP LOCKED` 릴레이 → `ride-payment-requests`(멱등키) |
+
+### 완료 기준
+
+| 기준 | 검증 |
+|---|---|
+| 1. 반납 좌표에 따라 구역 정책이 정해지고, 반납 불가 구역·서비스 지역 밖에서는 반납이 거절되며 라이드가 계속된다. | `ReturnZoneIndexTest` — 겹침 우선순위·경계·지역 밖, `RideSettlementIT` — 벌금·할인·정상 구역 반납, 반납 불가·지역 밖 422(라이드 `IN_PROGRESS`, 기기 `IN_USE`, 결제 요청 없음) → 옮긴 뒤 반납 |
+| 2. 요금이 계산식대로 확정되고 항목 합이 합계와 같다. | `FareCalculatorTest`, `RideSettlementIT` — 11분 벌금 구역 12,650원, 5분 주차 권장 + 구독권 30% 1,025원 |
+| 3. 같은 기기 동시 대여·같은 라이드 중복 반납에서 상태 전이와 결제 요청은 한 번이다. 분산 락을 잃어도 같다. | `RideConcurrencyIT` — 동시 대여 1건, 동시 반납 16건 같은 요금·결제 요청 1건, 락 없이 반납 트랜잭션 16건 → 확정 1건 |
+| 4. 결제 요청은 반납 확정과 함께만 남고, 브로커 확인 뒤에만 발행 완료가 된다. 여러 릴레이가 같은 요청을 동시에 보내지 않는다. | `RideSettlementIT` — 결제 요청 Kafka 1건·`published_at`, `PaymentOutboxRelayIT` — 실패 행만 재발행, 확인 마감 초과 미표시, 두 릴레이 동시 |
+| 5. 반납 뒤 원격 잠금이 확인돼야 다시 대여할 수 있다. | `RideSettlementIT` — DOOR_LOCK ACK → `AVAILABLE` → 재대여, 무응답 기기는 `LOCKED` 유지·재시도·대여 409 |
