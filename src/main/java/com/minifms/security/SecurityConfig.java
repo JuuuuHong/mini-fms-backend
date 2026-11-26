@@ -33,6 +33,9 @@ import org.springframework.security.web.SecurityFilterChain;
  *   POST /api/v1/vehicles/{id}/commands  vehicle:control   (원격 제어)
  *   POST /api/v1/telematics[/batch]      telematics:write  (단말 수집)
  *   POST /api/v1/incidents               incident:write    (RSU 보고)
+ *   PUT  /api/v1/devices/{id}            vehicle:control   (대여 기기 등록)
+ *   POST /api/v1/rides[/{id}/return]     ride:write        (대여·반납, 이용자 = 토큰 subject)
+ *   GET  /api/v1/rides/{id}              ride:write(본인) | fleet:read(전체)
  *   /actuator/health, /actuator/info     공개
  *   /actuator/**                         fleet:read
  * </pre>
@@ -53,6 +56,12 @@ public class SecurityConfig {
                         auth.requestMatchers(HttpMethod.POST, "/api/v1/auth/dev-token").permitAll();
                     }
                     auth.requestMatchers(HttpMethod.POST, "/api/v1/vehicles/*/commands").hasAuthority(authority(Scopes.VEHICLE_CONTROL))
+                            .requestMatchers(HttpMethod.PUT, "/api/v1/devices/*").hasAuthority(authority(Scopes.VEHICLE_CONTROL))
+                            .requestMatchers(HttpMethod.POST, "/api/v1/rides", "/api/v1/rides/*/return")
+                            .hasAuthority(authority(Scopes.RIDE_WRITE))
+                            // 이용자는 본인 라이드만(서비스가 subject 로 거른다), 관제는 모든 라이드
+                            .requestMatchers(HttpMethod.GET, "/api/v1/rides/*")
+                            .hasAnyAuthority(authority(Scopes.RIDE_WRITE), authority(Scopes.FLEET_READ))
                             .requestMatchers(HttpMethod.POST, "/api/v1/telematics", "/api/v1/telematics/batch")
                             .hasAuthority(authority(Scopes.TELEMATICS_WRITE))
                             .requestMatchers(HttpMethod.POST, "/api/v1/incidents").hasAuthority(authority(Scopes.INCIDENT_WRITE))

@@ -17,6 +17,7 @@ public record TopicProperties(
         @DefaultValue("vehicle-command-compensations") String commandCompensations,
         @DefaultValue("c-its-incident-alerts") String incidentAlerts,
         @DefaultValue("c-its-incident-results") String incidentResults,
+        @DefaultValue("ride-payment-requests") String paymentRequests,
         @DefaultValue("6") int partitions,
         @DefaultValue("1") int replicationFactor) {
 }

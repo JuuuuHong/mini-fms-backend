@@ -56,7 +56,9 @@ spring:
   task:
     scheduling:
       pool:
-        size: 4
+        # 브로커 장애 때 오래 막힐 수 있는 주기 작업(아웃박스 릴레이 2개·잠금 조정기·시뮬레이터)이 스레드를 다 잡아도
+        # Redis 만 쓰는 명령 타임아웃 보상·오래된 차량 정리는 돌 수 있게 넉넉히 둔다.
+        size: 8
       thread-name-prefix: fms-sched-
 
   mvc:
@@ -82,6 +84,7 @@ management:
     # 이력 검색의 장애는 검색 API 의 503 으로만 드러낸다.
     elasticsearch:
       enabled: false
+    # db 헬스는 ClickHouse 만 본다(DataSourceConfig). 라이드 DB 장애로 앱이 트래픽에서 빠지면 수집·돌발상황 경고까지 멈춘다.
 
 fms:
   topics:
@@ -93,6 +96,7 @@ fms:
     command-compensations: vehicle-command-compensations
     incident-alerts: c-its-incident-alerts
     incident-results: c-its-incident-results
+    payment-requests: ride-payment-requests
     partitions: 6
     replication-factor: 1
 
@@ -149,6 +153,67 @@ fms:
   outbox:
     relay-interval: 200ms
     batch-size: 200
+
+  ride:
+    # 라이드·기기 상태·결제 아웃박스 DB(PostgreSQL). HikariCP 속성을 그대로 받는다. 스키마는 Flyway(db/migration).
+    datasource:
+      jdbc-url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:fms}
+      username: ${POSTGRES_USER:fms}
+      password: ${POSTGRES_PASSWORD:fms_local}
+      pool-name: ride
+      maximum-pool-size: 10
+      connection-timeout: 3000
+    # 같은 기기에 대한 대여·반납 분산 락(Redisson)을 기다리는 최대 시간. 넘으면 409.
+    lock-wait: 3s
+    # 반납 판정에 쓰는 단말 위치(측정 시각)가 이보다 오래되면 반납을 받지 않는다(422).
+    max-location-age: 30s
+    pricing:
+      unlock-fee: 1000
+      per-minute-fee: 150
+      discount-zone-amount: 500
+      penalty-zone-amount: 10000
+      # 구독권 할인 = 잠금해제료 면제분 + 주행요금 × 할인율. 구역 벌금에는 적용하지 않는다.
+      subscription-plans:
+        - code: PASS_30
+          riding-discount-percent: 30
+        - code: PASS_UNLOCK_FREE
+          unlock-fee-waived: true
+    # 반납 뒤 잠금 명령 발송·확인(LOCKED → AVAILABLE)
+    lock-reconcile:
+      interval: 500ms
+      pending-check-interval: 1s
+      retry-base: 5s
+      retry-max: 5m
+      batch-size: 100
+
+  # 반납 구역(다각형, WKT 는 "경도 위도" 순서). 여러 구역이 겹치면 NO_RETURN > PENALTY > DISCOUNT > SERVICE 순으로 하나를 고른다.
+  # 어느 구역에도 속하지 않으면 서비스 지역 밖이라 반납을 받지 않는다.
+  return-zones:
+    zones:
+      - id: SEOUL-CENTRAL
+        name: 서울 도심 서비스 구역
+        type: SERVICE_ZONE
+        polygon: POLYGON((126.9480 37.5415, 127.0080 37.5415, 127.0080 37.5915, 126.9480 37.5915, 126.9480 37.5415))
+      - id: CITY-HALL-PARKING
+        name: 시청역 킥보드 주차 구역
+        type: DISCOUNT_ZONE
+        polygon: POLYGON((126.9770 37.5655, 126.9790 37.5655, 126.9790 37.5670, 126.9770 37.5670, 126.9770 37.5655))
+      - id: GWANGHWAMUN-CROSSWALK
+        name: 광화문 횡단보도·점자블록
+        type: PENALTY_ZONE
+        polygon: POLYGON((126.9760 37.5700, 126.9780 37.5700, 126.9780 37.5712, 126.9760 37.5712, 126.9760 37.5700))
+      - id: CHEONGGYECHEON
+        name: 청계천 산책로
+        type: NO_RETURN_ZONE
+        polygon: POLYGON((126.9780 37.5685, 126.9900 37.5685, 126.9900 37.5695, 126.9780 37.5695, 126.9780 37.5685))
+
+  payment-outbox:
+    relay-interval: 200ms
+    batch-size: 100
+    send-timeout: 5s
+    # 발행이 확인된 행을 이 기간 뒤 지운다.
+    retention: 7d
+    purge-interval: 1h
 
   security:
     jwt:

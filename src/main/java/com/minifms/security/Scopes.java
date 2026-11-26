@@ -13,8 +13,10 @@ public final class Scopes {
     public static final String TELEMATICS_WRITE = "telematics:write";
     /** 돌발상황 보고(RSU·센서 게이트웨이). */
     public static final String INCIDENT_WRITE = "incident:write";
+    /** 대여·반납(이용자 앱). 이용자 ID 는 토큰 subject. */
+    public static final String RIDE_WRITE = "ride:write";
 
-    public static final List<String> ALL = List.of(FLEET_READ, VEHICLE_CONTROL, TELEMATICS_WRITE, INCIDENT_WRITE);
+    public static final List<String> ALL = List.of(FLEET_READ, VEHICLE_CONTROL, TELEMATICS_WRITE, INCIDENT_WRITE, RIDE_WRITE);
 
     private Scopes() {
     }

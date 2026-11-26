@@ -24,11 +24,39 @@ public class FmsMetrics {
     public static final String INCIDENT_HISTORY_INDEXED = "fms.incident.history.indexed";
     public static final String INCIDENT_HISTORY_STALE = "fms.incident.history.stale";
     public static final String INCIDENT_HISTORY_REJECTED = "fms.incident.history.rejected";
+    public static final String RIDES_STARTED = "fms.ride.started";
+    public static final String RIDES_RETURNED = "fms.ride.returned";
+    public static final String RIDE_RETURN_REJECTED = "fms.ride.return_rejected";
+    public static final String DEVICE_LOCK = "fms.ride.device_lock";
+    public static final String PAYMENT_REQUESTS_PUBLISHED = "fms.payment.outbox.published";
 
     private final MeterRegistry registry;
 
     public FmsMetrics(MeterRegistry registry) {
         this.registry = registry;
+    }
+
+    public void rideStarted() {
+        registry.counter(RIDES_STARTED).increment();
+    }
+
+    /** 반납 확정 수(구역 정책별). */
+    public void rideReturned(String zoneType) {
+        registry.counter(RIDES_RETURNED, "zone_type", zoneType).increment();
+    }
+
+    /** 반납 거절 수(사유별: NO_RETURN_ZONE·OUT_OF_SERVICE_AREA·LOCATION_STALE·LOCATION_UNAVAILABLE). */
+    public void rideReturnRejected(String reason) {
+        registry.counter(RIDE_RETURN_REJECTED, "reason", reason).increment();
+    }
+
+    /** 반납 뒤 원격 잠금 진행(REQUESTED·CONFIRMED·FAILED). FAILED 가 늘면 잠기지 않은 채 세워진 기기가 있다는 뜻이다. */
+    public void deviceLock(String result) {
+        registry.counter(DEVICE_LOCK, "result", result).increment();
+    }
+
+    public void paymentRequestsPublished(int count) {
+        increment(registry.counter(PAYMENT_REQUESTS_PUBLISHED), count);
     }
 
     public void ingested(int count) {

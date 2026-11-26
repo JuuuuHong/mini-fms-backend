@@ -70,10 +70,17 @@ public class VehicleCommandService {
     }
 
     public VehicleCommand request(String vehicleId, CommandType type) {
+        return request(vehicleId, type, UUID.randomUUID().toString());
+    }
+
+    /**
+     * 호출하는 쪽이 정한 commandId 로 요청한다. 명령을 보내기 전에 자기 쪽 기록에 이 ID 를 먼저 남겨 두어야 하는 경우
+     * (예: 반납 뒤 잠금 조정기가 기기 행을 선점한 뒤 발송)에 쓴다.
+     */
+    public VehicleCommand request(String vehicleId, CommandType type, String commandId) {
         if (!locationRepository.exists(vehicleId)) {
             throw new NotFoundException("텔레메트리를 보낸 적 없는 차량입니다: " + vehicleId);
         }
-        String commandId = UUID.randomUUID().toString();
         long now = clock.millis();
         long deadline = now + properties.ackTimeout().toMillis();
 

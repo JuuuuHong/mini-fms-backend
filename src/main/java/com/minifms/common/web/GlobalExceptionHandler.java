@@ -4,13 +4,13 @@ import com.minifms.common.kafka.EventPublishException;
 import com.minifms.incident.history.HistoryUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.TransientDataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
@@ -36,6 +36,13 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(detail);
     }
 
+    @ExceptionHandler(UnprocessableException.class)
+    public ResponseEntity<ProblemDetail> handleUnprocessable(UnprocessableException e) {
+        ProblemDetail detail = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, e.getMessage());
+        e.properties().forEach(detail::setProperty);
+        return ResponseEntity.unprocessableEntity().body(detail);
+    }
+
     @ExceptionHandler(InvalidRequestException.class)
     public ResponseEntity<ProblemDetail> handleInvalid(InvalidRequestException e) {
         ProblemDetail detail = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, e.getMessage());
@@ -57,9 +64,13 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 .body(ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage()));
     }
 
-    /** Redis·ClickHouse 연결 실패·시간 초과는 잠시 뒤 다시 시도하면 되는 오류다(503). */
-    @ExceptionHandler({DataAccessResourceFailureException.class, TransientDataAccessException.class})
-    public ResponseEntity<ProblemDetail> handleStoreUnavailable(DataAccessException e) {
+    /**
+     * Redis·ClickHouse·PostgreSQL 연결 실패·시간 초과는 잠시 뒤 다시 시도하면 되는 오류다(503).
+     * 트랜잭션을 시작할 때 DB 연결을 얻지 못하면 DataAccessException 이 아니라 CannotCreateTransactionException 이 난다.
+     */
+    @ExceptionHandler({DataAccessResourceFailureException.class, TransientDataAccessException.class,
+            CannotCreateTransactionException.class})
+    public ResponseEntity<ProblemDetail> handleStoreUnavailable(RuntimeException e) {
         log.warn("저장소 일시 장애: {}", e.toString());
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .header(HttpHeaders.RETRY_AFTER, "5")

@@ -18,12 +18,13 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.clickhouse.ClickHouseContainer;
 import org.testcontainers.elasticsearch.ElasticsearchContainer;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.lifecycle.Startables;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * 통합 테스트 공통 기반. Kafka·Redis·ClickHouse·Elasticsearch 컨테이너를 JVM 당 한 번 띄우고(싱글턴),
+ * 통합 테스트 공통 기반. Kafka·Redis·ClickHouse·Elasticsearch·PostgreSQL 컨테이너를 JVM 당 한 번 띄우고(싱글턴),
  * 모든 테스트 클래스가 같은 Spring 컨텍스트를 재사용한다. 테스트끼리 상태를 공유하므로
  * 각 테스트는 고유한 vehicleId·좌표를 쓴다.
  */
@@ -46,8 +47,11 @@ public abstract class IntegrationTestSupport {
                     .withEnv("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
                     .withEnv("cluster.routing.allocation.disk.threshold_enabled", "false");
 
+    protected static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>(DockerImageName.parse("postgres:17-alpine")).withDatabaseName("fms");
+
     static {
-        Startables.deepStart(KAFKA, REDIS, CLICKHOUSE, ELASTICSEARCH).join();
+        Startables.deepStart(KAFKA, REDIS, CLICKHOUSE, ELASTICSEARCH, POSTGRES).join();
     }
 
     @DynamicPropertySource
@@ -57,6 +61,9 @@ public abstract class IntegrationTestSupport {
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
         registry.add("spring.datasource.url", CLICKHOUSE::getJdbcUrl);
         registry.add("spring.datasource.username", CLICKHOUSE::getUsername);
+        registry.add("fms.ride.datasource.jdbc-url", POSTGRES::getJdbcUrl);
+        registry.add("fms.ride.datasource.username", POSTGRES::getUsername);
+        registry.add("fms.ride.datasource.password", POSTGRES::getPassword);
         registry.add("spring.datasource.password", CLICKHOUSE::getPassword);
         registry.add("spring.elasticsearch.uris", () -> "http://" + ELASTICSEARCH.getHttpHostAddress());
     }

@@ -17,7 +17,7 @@ fms:
       enabled: true
       min-delay: 100ms
       max-delay: 300ms
-      unresponsive-vehicles: [T-NORESP-1, T-NORESP-2]
+      unresponsive-vehicles: [T-NORESP-1, T-NORESP-2, T-RIDE-NORESP]
       rejecting-vehicles: [T-REJECT]
 
   command:
@@ -39,3 +39,35 @@ fms:
         longitude: 129.0756
         radius-meters: 1000
         hysteresis-meters: 30
+
+  ride:
+    lock-wait: 1s
+    lock-reconcile:
+      interval: 200ms
+      pending-check-interval: 200ms
+      retry-base: 300ms
+      retry-max: 1s
+
+  payment-outbox:
+    relay-interval: 100ms
+
+  # 다른 테스트의 차량과 겹치지 않도록 대전 좌표에 둔다(RideTestZones 가 같은 좌표를 쓴다).
+  #   서비스 구역 안에 할인·벌금·반납 불가 구역이 따로 있다.
+  return-zones:
+    zones:
+      - id: T-SERVICE
+        name: 테스트 서비스 구역
+        type: SERVICE_ZONE
+        polygon: POLYGON((127.3700 36.3400, 127.3900 36.3400, 127.3900 36.3600, 127.3700 36.3600, 127.3700 36.3400))
+      - id: T-DISCOUNT
+        name: 테스트 주차 권장 구역
+        type: DISCOUNT_ZONE
+        polygon: POLYGON((127.3810 36.3510, 127.3820 36.3510, 127.3820 36.3520, 127.3810 36.3520, 127.3810 36.3510))
+      - id: T-PENALTY
+        name: 테스트 주차 금지 구역
+        type: PENALTY_ZONE
+        polygon: POLYGON((127.3810 36.3480, 127.3820 36.3480, 127.3820 36.3490, 127.3810 36.3490, 127.3810 36.3480))
+      - id: T-NO-RETURN
+        name: 테스트 반납 불가 구역
+        type: NO_RETURN_ZONE
+        polygon: POLYGON((127.3780 36.3500, 127.3790 36.3500, 127.3790 36.3510, 127.3780 36.3510, 127.3780 36.3500))
