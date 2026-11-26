@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import java.time.Duration;
@@ -18,8 +19,8 @@ import org.springframework.validation.annotation.Validated;
  *
  * @param lockWait          같은 기기에 대한 대여·반납 분산 락을 기다리는 최대 시간. 넘으면 409.
  * @param maxLocationAge    대여·반납 판정에 쓰는 단말 위치(측정 시각)의 최대 나이. 더 오래되면 받지 않는다.
- * @param returnMaxSpeedKmh 반납을 받는 단말 보고 속도의 상한(km/h). 더 빠르면 아직 움직이는 중이라 그 위치로 판정하지 않는다
- *                          (지나온 구역으로 판정되는 것을 막는다). 정차 중 GPS 속도 흔들림을 넘는 값으로 둔다.
+ * @param returnMaxSpeedKmh 반납을 받는 단말 보고 속도의 상한(km/h). 더 빠르고 전원도 켜져 있으면 아직 움직이는 중이라 그 위치로
+ *                          판정하지 않는다(지나온 구역으로 판정되는 것을 막는다). 정차 중 GPS 속도 흔들림을 넘는 값으로 둔다.
  */
 @Validated
 @ConfigurationProperties(prefix = "fms.ride")
@@ -46,11 +47,15 @@ public record RideProperties(
         }
     }
 
+    /** 구독권 코드 형식. 대여 요청의 subscriptionPlan 과 DB 열(VARCHAR(32))이 같은 형식을 쓴다. */
+    public static final String PLAN_CODE_PATTERN = "^[A-Z0-9_]{1,32}$";
+
     /**
      * 구독권 할인 = (unlockFeeWaived 면 잠금해제료) + 주행요금 × ridingDiscountPercent / 100(원 미만 버림).
+     * 코드 형식이 대여 요청 검증과 다르면 판매 중인 구독권을 지정할 수 없으므로(400) 기동할 때 거부한다.
      */
     public record SubscriptionPlan(
-            @NotBlank String code,
+            @NotBlank @Pattern(regexp = PLAN_CODE_PATTERN) String code,
             @DefaultValue("false") boolean unlockFeeWaived,
             @DefaultValue("0") @Min(0) @Max(100) int ridingDiscountPercent) {
     }

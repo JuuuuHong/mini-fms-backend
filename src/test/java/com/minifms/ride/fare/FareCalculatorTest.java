@@ -7,6 +7,9 @@ import com.minifms.common.config.properties.RideProperties.LockReconcile;
 import com.minifms.common.config.properties.RideProperties.Pricing;
 import com.minifms.common.config.properties.RideProperties.SubscriptionPlan;
 import com.minifms.ride.zone.ZoneType;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
 import java.time.Duration;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -96,6 +99,17 @@ class FareCalculatorTest {
         assertThat(calculator.offersPlan("PASS_30")).isTrue();
         assertThat(calculator.offersPlan("DISCONTINUED")).isFalse();
         assertThatThrownBy(() -> calculator.tariffFor("DISCONTINUED")).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void 설정의_구독권_코드는_대여_요청과_같은_형식이어야_한다() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new SubscriptionPlan("PASS_30", false, 30))).isEmpty();
+            // 형식이 다르면 판매 중인 구독권을 대여 때 지정할 수 없다(요청 검증 400).
+            assertThat(validator.validate(new SubscriptionPlan("pass-30", false, 30))).isNotEmpty();
+            assertThat(validator.validate(new SubscriptionPlan("P".repeat(33), false, 30))).isNotEmpty();
+        }
     }
 
     @Test

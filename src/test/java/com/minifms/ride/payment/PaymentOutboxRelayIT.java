@@ -31,7 +31,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.simple.JdbcClient;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.support.JdbcTransactionManager;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -66,7 +66,7 @@ class PaymentOutboxRelayIT extends IntegrationTestSupport {
         dataSource = dataSource(POSTGRES.getJdbcUrl().replaceFirst("/fms(\\?|$)", "/" + DATABASE + "$1"));
         Flyway.configure().dataSource(dataSource).load().migrate();
         jdbc = JdbcClient.create(dataSource);
-        transactionTemplate = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        transactionTemplate = new TransactionTemplate(new JdbcTransactionManager(dataSource));
     }
 
     @AfterAll

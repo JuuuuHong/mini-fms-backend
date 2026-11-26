@@ -15,6 +15,7 @@ import com.minifms.ride.fare.FareCalculator;
 import com.minifms.ride.fare.Tariff;
 import com.minifms.ride.zone.ReturnZoneIndex;
 import com.minifms.ride.zone.ZoneJudgement;
+import com.minifms.telematics.domain.EngineStatus;
 import com.minifms.vehicle.location.VehicleLocationRepository;
 import com.minifms.vehicle.location.VehicleSnapshot;
 import java.time.Clock;
@@ -35,7 +36,7 @@ import org.springframework.stereotype.Service;
  *
  * <pre>
  * 대여: [기기 락] 기기·사용자·지정한 구독권·단말 위치(신선도) 확인 → 요금표·구독권 스냅샷 → TX{ 기기 AVAILABLE→IN_USE, 라이드 생성 }
- * 반납: [기기 락] 단말 최신 위치(신선도·대여 뒤 측정·정차) → 구역 판정 → 요금 계산
+ * 반납: [기기 락] 단말 최신 위치(신선도·대여 뒤 측정·수신·정차) → 구역 판정 → 요금 계산
  *              → TX{ 라이드 COMPLETED, 기기 IN_USE→LOCKED, 결제 요청 아웃박스(합계 0원이면 없음) }
  *       이후 잠금 명령 발송·확인은 DeviceLockReconciler, 결제 요청 발행은 PaymentOutboxRelay 가 비동기로 한다.
  * </pre>
@@ -205,20 +206,24 @@ public class RideService {
     /**
      * 반납 판정에 쓸 단말 위치. 신선도(maxLocationAge)에 더해 두 가지를 요구한다.
      * <ul>
-     *   <li>대여한 뒤에 측정한 위치 — 대여 전 보고로는 이번 라이드가 끝난 자리를 알 수 없다(짧은 라이드에서 생긴다).</li>
-     *   <li>정차 중(속도 ≤ returnMaxSpeedKmh) — 움직이는 중의 보고는 다음 보고 때 이미 다른 자리다. 서비스 구역을 지나며
-     *       보낸 보고로 바로 옆 벌금·반납 불가 구역의 반납을 판정하지 않는다.</li>
+     *   <li>대여한 뒤의 위치 — 측정 시각(단말 시계)과 서버가 받은 시각이 모두 대여 시각 이후. 대여 전 보고로는 이번 라이드가
+     *       끝난 자리를 알 수 없다(짧은 라이드에서 생긴다). 받은 시각도 보는 것은 시계가 앞선 단말(최대 30초 허용)이 대여 전에
+     *       보낸 보고가 측정 시각만으로는 "대여 뒤"로 보이기 때문이다.</li>
+     *   <li>정차 중 — 속도 ≤ returnMaxSpeedKmh 이거나 전원(engineStatus)이 꺼져 있다. 달리는 중의 보고는 다음 보고 때 이미
+     *       다른 자리라, 서비스 구역을 지나며 보낸 보고로 바로 옆 벌금·반납 불가 구역의 반납을 판정하지 않는다. 전원이 꺼진 보고도
+     *       정차로 보는 것은 세워 둔 기기의 GPS 속도가 도심 다중경로로 기준을 넘게 흔들려 반납이 막히는 것을 피하기 위해서다.</li>
      * </ul>
-     * 셋 다 단말이 곧 새 위치를 보내면 풀리므로 422(잠시 뒤 재시도)다. 측정 시각은 단말 시계(GPS 시각)다.
+     * 모두 단말이 곧 새 위치를 보내면 풀리므로 422(잠시 뒤 재시도)다.
      */
     private VehicleSnapshot returnLocation(Ride ride, Instant now) {
         VehicleSnapshot location = freshLocation(ride.deviceId(), now, "반납");
-        if (location.timestamp().isBefore(ride.startedAt())) {
+        if (location.timestamp().isBefore(ride.startedAt()) || location.updatedAt().isBefore(ride.startedAt())) {
             throw new UnprocessableException("대여한 뒤의 기기 위치가 아직 없어 반납할 수 없습니다. 잠시 뒤 다시 시도하세요.",
                     Map.of("reason", "LOCATION_BEFORE_RIDE_START", "locationMeasuredAt", location.timestamp().toString(),
-                            "startedAt", ride.startedAt().toString()));
+                            "locationReceivedAt", location.updatedAt().toString(), "startedAt", ride.startedAt().toString()));
         }
-        if (location.speed() > properties.returnMaxSpeedKmh()) {
+        boolean stopped = location.speed() <= properties.returnMaxSpeedKmh() || location.engineStatus() == EngineStatus.OFF;
+        if (!stopped) {
             throw new UnprocessableException("기기가 움직이는 중이라 반납할 수 없습니다. 세운 뒤 다시 시도하세요.",
                     Map.of("reason", "DEVICE_MOVING", "speedKmh", location.speed(),
                             "maxSpeedKmh", properties.returnMaxSpeedKmh()));

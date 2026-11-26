@@ -98,7 +98,7 @@ class DeviceLockReconcilerTest {
     }
 
     @Test
-    void 선점_뒤_발송이_실패하면_선점을_그대로_두고_선점한_명령_ID_로_백오프를_건다() {
+    void 선점_뒤_발송이_실패하면_선점을_그대로_두고_선점_때의_확인_시각에_명령_기록으로_판단한다() {
         when(devices.findLockDue(any(), eq(100))).thenReturn(List.of(locked("KB-1")));
         when(devices.claimLockCommand(eq("KB-1"), anyString(), any())).thenReturn(true);
         when(commandService.request(eq("KB-1"), eq(CommandType.DOOR_LOCK), anyString()))
@@ -106,10 +106,10 @@ class DeviceLockReconcilerTest {
 
         reconciler.reconcileOnce();
 
-        ArgumentCaptor<String> claimed = ArgumentCaptor.forClass(String.class);
-        verify(devices).claimLockCommand(eq("KB-1"), claimed.capture(), any());
-        // 첫 시도의 백오프 = retryBase 5초. 명령이 나갔을 수 있으므로 선점을 풀지 않는다(다음 확인 때 명령 기록으로 판단).
-        verify(devices).postponeLockCheck("KB-1", claimed.getValue(), NOW.plusSeconds(5));
+        // 선점이 확인 시각을 1초 뒤(pendingCheckInterval)로 넣었다. 명령이 나갔을 수 있으므로 선점을 풀지 않고,
+        // 백오프로 미루지도 않는다(나가서 ACK 됐다면 1초 뒤 바로 대여 가능이 되어야 한다).
+        verify(devices).claimLockCommand(eq("KB-1"), anyString(), eq(NOW.plusSeconds(1)));
+        verify(devices, never()).postponeLockCheck(anyString(), any(), any());
         verify(devices, never()).releaseLockClaim(anyString(), anyString(), any());
     }
 

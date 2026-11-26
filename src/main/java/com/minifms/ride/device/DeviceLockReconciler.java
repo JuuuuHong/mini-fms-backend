@@ -154,10 +154,12 @@ public class DeviceLockReconciler implements SchedulingConfigurer {
             log.warn("텔레메트리가 없는 기기라 잠금 명령을 보내지 못했습니다 deviceId={}", device.deviceId());
             return Outcome.WAITING;
         } catch (RuntimeException e) {
-            // 선점 뒤 보내다 실패했다(Redis 일시 장애 등). 명령이 나갔는지 모르므로 선점은 그대로 두고 다음 확인 때 명령 기록으로
-            // 성패를 본다. 다음 확인은 백오프 뒤로 미룬다 — 바깥 catch 는 스냅샷의 명령 ID(선점 전 null)로 미루려 해 행을 찾지 못한다.
-            log.warn("잠금 명령 발송 실패 deviceId={} commandId={}: {}", device.deviceId(), commandId, e.toString());
-            devices.postponeLockCheck(device.deviceId(), commandId, now.plus(properties.backoff(device.lockAttempts() + 1)));
+            // 선점 뒤 보내다 실패했다(Redis 일시 장애 등). 명령이 나갔는지 모르므로 선점은 그대로 두고, 선점 때 넣은 확인 시각
+            // (pendingCheckInterval 뒤)에 명령 기록으로 성패를 본다: ACK 면 바로 대여 가능, 기록이 없거나 실패면 그때 백오프.
+            // 여기서 백오프로 미루면 실제로 나가 ACK 된 기기도 그만큼(최대 retry-max) 빌려줄 수 없다. 바깥 catch 로 넘기지 않는 것은
+            // 그쪽이 스냅샷의 명령 ID(선점 전 null)로 확인 시각을 바꾸려 하기 때문이다.
+            log.warn("잠금 명령 발송 실패 deviceId={} commandId={}, {} 뒤 명령 기록으로 확인합니다: {}", device.deviceId(), commandId,
+                    properties.pendingCheckInterval(), e.toString());
             return Outcome.WAITING;
         }
         metrics.deviceLock("REQUESTED");

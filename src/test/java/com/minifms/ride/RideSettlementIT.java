@@ -21,6 +21,7 @@ import com.minifms.ride.device.DeviceState;
 import com.minifms.security.Scopes;
 import com.minifms.support.KafkaTopicProbe;
 import com.minifms.support.TestEvents;
+import com.minifms.telematics.domain.EngineStatus;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -179,7 +180,8 @@ class RideSettlementIT extends RideTestSupport {
             List<ConsumerRecord<String, String>> records = probe.pollUntil(
                     received -> received.stream().anyMatch(r -> paidRide.toString().equals(r.key())), Duration.ofSeconds(20));
             assertThat(records).anyMatch(r -> paidRide.toString().equals(r.key()));
-            assertThat(records).noneMatch(r -> freeRide.toString().equals(r.key()));
+            // 파티션이 달라 Kafka 순서로는 부재를 증명할 수 없다(주 증명은 위의 아웃박스 0건). 릴레이 주기(100ms)의 여러 배를 더 본다.
+            assertThat(probe.pollFor(Duration.ofSeconds(2))).noneMatch(r -> freeRide.toString().equals(r.key()));
         }
     }
 
@@ -194,8 +196,8 @@ class RideSettlementIT extends RideTestSupport {
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason").value("LOCATION_BEFORE_RIDE_START"));
 
-        // 서비스 구역을 달리는 중의 보고로는 판정하지 않는다(다음 보고 때 이미 옆 벌금 구역일 수 있다).
-        report(deviceId, SERVICE, 15.0, System.currentTimeMillis() + 1);
+        // 서비스 구역을 달리는 중(전원 ON)의 보고로는 판정하지 않는다(다음 보고 때 이미 옆 벌금 구역일 수 있다).
+        reportNow(deviceId, SERVICE, 15.0, EngineStatus.ON);
         returnRequest(userId, rideId)
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason").value("DEVICE_MOVING"))
@@ -204,11 +206,44 @@ class RideSettlementIT extends RideTestSupport {
         assertThat(paymentOutboxRows(rideId)).isZero();
 
         // 벌금 구역에 세운 보고가 오면 그 자리로 판정한다. 정차 중 GPS 흔들림(3km/h 이하)은 정차로 본다.
-        report(deviceId, PENALTY, 2.5, System.currentTimeMillis() + 2);
+        reportNow(deviceId, PENALTY, 2.5, EngineStatus.ON);
         returnRequest(userId, rideId)
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.returnInfo.zoneType").value("PENALTY_ZONE"))
                 .andExpect(jsonPath("$.fare.zoneAdjustment").value(10_000));
+    }
+
+    @Test
+    void 전원이_꺼진_기기는_GPS_속도가_흔들려도_정차로_본다() throws Exception {
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId);
+
+        // 세워 둔 기기의 GPS 속도가 도심 다중경로로 기준(3km/h)을 넘게 흔들려도, 전원이 꺼져 있으면 반납이 막히지 않는다.
+        reportNow(deviceId, DISCOUNT, 5.5, EngineStatus.OFF);
+        returnRequest(userId, rideId)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.returnInfo.zoneType").value("DISCOUNT_ZONE"));
+    }
+
+    @Test
+    void 시계가_앞선_단말이_대여_전에_보낸_보고로는_반납을_판정하지_않는다() throws Exception {
+        String deviceId = registerDevice(TestEvents.uniqueId("KB"));
+        // 단말 시계가 20초 앞서 있다: 대여 전에 받은 보고의 측정 시각이 대여 시각보다 뒤로 찍힌다.
+        report(deviceId, SERVICE, 0.0, EngineStatus.OFF, System.currentTimeMillis() + 20_000, System.currentTimeMillis());
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId);
+
+        returnRequest(userId, rideId)
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("LOCATION_BEFORE_RIDE_START"));
+
+        // 대여 뒤에 받은 보고(같은 시계라 측정 시각은 더 앞선다)로는 판정한다.
+        long now = System.currentTimeMillis() + 1;
+        report(deviceId, PENALTY, 0.0, EngineStatus.OFF, now + 21_000, now);
+        returnRequest(userId, rideId)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.returnInfo.zoneType").value("PENALTY_ZONE"));
     }
 
     @Test

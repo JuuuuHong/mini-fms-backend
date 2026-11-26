@@ -60,23 +60,34 @@ abstract class RideTestSupport extends IntegrationTestSupport {
         return deviceId;
     }
 
-    /** 단말이 측정 시각 timestamp 에 이 좌표에 정차해 있다고 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
+    /** 단말이 측정 시각 timestamp 에 이 좌표에 정차해(전원 OFF) 있다고 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
     void moveTo(String deviceId, double[] position, long timestamp) {
-        report(deviceId, position, 0.0, timestamp);
-    }
-
-    /** 단말이 측정 시각 timestamp 에 이 좌표·속도(km/h)를 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
-    void report(String deviceId, double[] position, double speedKmh, long timestamp) {
-        locationRepository.updateIfNewer(new TelematicsEvent(deviceId, position[0], position[1], speedKmh, 80.0,
-                speedKmh > 0 ? EngineStatus.ON : EngineStatus.OFF, timestamp), System.currentTimeMillis());
+        report(deviceId, position, 0.0, EngineStatus.OFF, timestamp, System.currentTimeMillis());
     }
 
     /**
-     * 대여한 뒤 단말이 이 좌표에 정차했다고 보고한다. 반납은 대여 뒤에 측정한 정차 위치로만 판정한다.
-     * 측정 시각은 밀리초, 대여 시각은 마이크로초라 같은 밀리초 안이면 대여 전으로 보일 수 있어 1ms 뒤로 둔다.
+     * 단말 보고 하나를 반영한다(측정 시각이 더 최신일 때만).
+     *
+     * @param measuredAt 단말이 잰 시각(단말 시계)
+     * @param receivedAt 서버가 받은 시각(서버 시계)
+     */
+    void report(String deviceId, double[] position, double speedKmh, EngineStatus engine, long measuredAt, long receivedAt) {
+        locationRepository.updateIfNewer(new TelematicsEvent(deviceId, position[0], position[1], speedKmh, 80.0, engine,
+                measuredAt), receivedAt);
+    }
+
+    /** 대여한 뒤 지금 이 보고가 왔다(측정·수신 모두 지금). 대여 시각과 같은 밀리초에 겹치지 않게 1ms 뒤로 둔다. */
+    void reportNow(String deviceId, double[] position, double speedKmh, EngineStatus engine) {
+        long now = System.currentTimeMillis() + 1;
+        report(deviceId, position, speedKmh, engine, now, now);
+    }
+
+    /**
+     * 대여한 뒤 단말이 이 좌표에 세우고 전원을 껐다고 보고한다. 반납은 대여 뒤에 측정·수신한 정차 위치로만 판정한다.
+     * 측정·수신 시각은 밀리초, 대여 시각은 마이크로초라 같은 밀리초 안이면 대여 전으로 보일 수 있어 1ms 뒤로 둔다.
      */
     void reportStopped(String deviceId, double[] position) {
-        moveTo(deviceId, position, System.currentTimeMillis() + 1);
+        reportNow(deviceId, position, 0.0, EngineStatus.OFF);
     }
 
     ResultActions rentRequest(String userId, String deviceId) throws Exception {

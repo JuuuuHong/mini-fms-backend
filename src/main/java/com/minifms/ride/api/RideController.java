@@ -1,5 +1,6 @@
 package com.minifms.ride.api;
 
+import com.minifms.common.config.properties.RideProperties;
 import com.minifms.common.web.InvalidRequestException;
 import com.minifms.ride.Ride;
 import com.minifms.ride.RideService;
@@ -71,6 +72,6 @@ public class RideController {
      */
     public record RentRequest(
             @NotBlank @Pattern(regexp = DEVICE_ID_PATTERN) String deviceId,
-            @Pattern(regexp = "^[A-Z0-9_]{1,32}$") String subscriptionPlan) {
+            @Pattern(regexp = RideProperties.PLAN_CODE_PATTERN) String subscriptionPlan) {
     }
 }
