@@ -58,6 +58,23 @@ class ReturnZoneIndexTest {
     }
 
     @Test
+    void 경도는_x_위도는_y_로_판정한다() {
+        // 위 구역들은 모두 x=y 에 대칭이라 축을 뒤바꿔도 판정이 같다. 동서로 긴 구역으로 축 순서를 따로 확인한다.
+        ReturnZoneIndex wide = indexOf(zone("EAST-WEST", ZoneType.SERVICE_ZONE, 0, 0, 10, 2));
+        assertThat(wide.judge(1, 8).zoneId()).as("위도 1·경도 8 은 안").isEqualTo("EAST-WEST");
+        assertThat(wide.judge(8, 1)).as("위도 8·경도 1 은 밖").isEqualTo(ZoneJudgement.OUT_OF_SERVICE_AREA);
+    }
+
+    @Test
+    void 같은_정책끼리_겹치면_ID_가_앞선_구역() {
+        ReturnZoneIndex twins = indexOf(
+                zone("DISCOUNT-B", ZoneType.DISCOUNT_ZONE, 0, 0, 2, 2),
+                zone("DISCOUNT-A", ZoneType.DISCOUNT_ZONE, 1, 1, 3, 3));
+        assertThat(twins.judge(1.5, 1.5).zoneId()).isEqualTo("DISCOUNT-A");
+        assertThat(twins.judge(0.5, 0.5).zoneId()).isEqualTo("DISCOUNT-B");
+    }
+
+    @Test
     void 위도와_경도를_뒤바꾼_WKT_는_기동할_때_거부한다() {
         // 서울 시청(위도 37.56, 경도 126.97)을 "위도 경도" 순서로 잘못 적으면 y=126.97 로 위도 범위를 벗어난다.
         assertThatThrownBy(() -> new ReturnZoneIndex(new ReturnZoneProperties(List.of(new Zone("SWAPPED", "뒤바뀜",

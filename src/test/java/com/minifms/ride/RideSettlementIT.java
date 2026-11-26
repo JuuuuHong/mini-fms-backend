@@ -361,20 +361,44 @@ class RideSettlementIT extends RideTestSupport {
         returnRequest(userId, rideId).andExpect(status().isOk());
 
         // 응답 마감 2초 → TIMEOUT → 백오프 뒤 새 잠금 명령
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
-                assertThat(device(deviceId).lockAttempts()).isGreaterThanOrEqualTo(2));
-        Device device = device(deviceId);
-        assertThat(device.state()).isEqualTo(DeviceState.LOCKED);
+        String first = await().atMost(Duration.ofSeconds(5)).until(() -> device(deviceId).lockCommandId(), id -> id != null);
+        String second = await().atMost(Duration.ofSeconds(15)).until(() -> device(deviceId).lockCommandId(),
+                id -> id != null && !id.equals(first));
+        assertThat(device(deviceId).state()).isEqualTo(DeviceState.LOCKED);
+        assertThat(device(deviceId).lockAttempts()).isGreaterThanOrEqualTo(2);
         rentRequest(TestEvents.uniqueId("user"), deviceId)
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.state").value("LOCKED"));
 
-        // 두 번째 잠금 명령은 첫 명령이 TIMEOUT 으로 끝난 뒤에만 나간다. 지금 기록된 명령도 응답이 없어 끝나지 않았거나 TIMEOUT 이다.
-        if (device.lockCommandId() != null) {
-            VehicleCommand latest = commandRepository.find(device.lockCommandId()).orElseThrow();
-            assertThat(latest.type()).isEqualTo(CommandType.DOOR_LOCK);
-            assertThat(latest.status()).isNotEqualTo(CommandStatus.ACKNOWLEDGED);
-        }
+        // 두 번째 잠금 명령은 첫 명령이 TIMEOUT 으로 끝난 뒤에만 나간다.
+        VehicleCommand firstCommand = commandRepository.find(first).orElseThrow();
+        VehicleCommand secondCommand = commandRepository.find(second).orElseThrow();
+        assertThat(firstCommand.type()).isEqualTo(CommandType.DOOR_LOCK);
+        assertThat(firstCommand.status()).isEqualTo(CommandStatus.TIMEOUT);
+        assertThat(secondCommand.type()).isEqualTo(CommandType.DOOR_LOCK);
+        assertThat(secondCommand.requestedAt()).isAfterOrEqualTo(firstCommand.completedAt());
+    }
+
+    @Test
+    void 잠금_명령을_거절하는_기기는_LOCKED_로_남고_백오프_뒤_다시_보낸다() throws Exception {
+        String deviceId = registerDeviceAt("T-RIDE-REJECT", SERVICE);
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId);
+        reportStopped(deviceId, SERVICE);
+        returnRequest(userId, rideId).andExpect(status().isOk());
+
+        // 단말 거절 → 명령 FAILED → 조정기가 명령을 비우고 백오프 뒤 새 명령을 보낸다. 잠김이 확인되지 않았으니 빌려주지 않는다.
+        String first = await().atMost(Duration.ofSeconds(5)).until(() -> device(deviceId).lockCommandId(), id -> id != null);
+        await().atMost(Duration.ofSeconds(10)).until(() -> device(deviceId).lockCommandId(),
+                id -> id != null && !id.equals(first));
+        VehicleCommand rejected = commandRepository.find(first).orElseThrow();
+        assertThat(rejected.type()).isEqualTo(CommandType.DOOR_LOCK);
+        assertThat(rejected.status()).isEqualTo(CommandStatus.FAILED);
+        assertThat(device(deviceId).state()).isEqualTo(DeviceState.LOCKED);
+        assertThat(device(deviceId).lockAttempts()).isGreaterThanOrEqualTo(2);
+        rentRequest(TestEvents.uniqueId("user"), deviceId)
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.state").value("LOCKED"));
     }
 
     private String userWithTwoPasses(Instant now) {
@@ -388,11 +412,13 @@ class RideSettlementIT extends RideTestSupport {
         return mockMvc.perform(get("/api/v1/rides/{id}", rideId).with(asRider(userId)));
     }
 
+    /** 이 라이드의 결제 요청이 정확히 한 건 나왔는지 확인하고 그 본문을 돌려준다. */
     private JsonNode awaitPaymentRequest(UUID rideId) throws Exception {
         try (KafkaTopicProbe probe = new KafkaTopicProbe(bootstrapServers(), topics.paymentRequests())) {
-            List<ConsumerRecord<String, String>> records = probe.pollUntil(
-                    received -> received.stream().anyMatch(r -> rideId.toString().equals(r.key())), Duration.ofSeconds(20));
-            List<ConsumerRecord<String, String>> mine = records.stream()
+            probe.pollUntil(received -> received.stream().anyMatch(r -> rideId.toString().equals(r.key())),
+                    Duration.ofSeconds(20));
+            // 첫 건을 받은 뒤에도 더 읽는다. 릴레이가 같은 행을 다시 보냈다면 여기서 두 번째가 보인다(릴레이 주기 100ms).
+            List<ConsumerRecord<String, String>> mine = probe.pollFor(Duration.ofSeconds(3)).stream()
                     .filter(r -> rideId.toString().equals(r.key())).toList();
             assertThat(mine).as("결제 요청").hasSize(1);
             return objectMapper.readTree(mine.get(0).value());

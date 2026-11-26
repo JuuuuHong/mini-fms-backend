@@ -2,15 +2,25 @@ package com.minifms.ride;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
+import com.minifms.common.config.properties.RideProperties;
+import com.minifms.common.lock.DistributedLock;
+import com.minifms.common.metrics.FmsMetrics;
 import com.minifms.common.web.ConflictException;
 import com.minifms.ride.device.DeviceState;
 import com.minifms.ride.fare.Fare;
 import com.minifms.ride.fare.FareCalculator;
+import com.minifms.ride.zone.ReturnZoneIndex;
 import com.minifms.ride.zone.ZoneType;
 import com.minifms.support.TestEvents;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +54,18 @@ class RideConcurrencyIT extends RideTestSupport {
     FareCalculator fareCalculator;
     @Autowired
     RedissonClient redisson;
+    @Autowired
+    DistributedLock distributedLock;
+    @Autowired
+    SubscriptionRepository subscriptions;
+    @Autowired
+    ReturnZoneIndex zoneIndex;
+    @Autowired
+    RideProperties rideProperties;
+    @Autowired
+    FmsMetrics metrics;
+    @Autowired
+    Clock clock;
 
     @Test
     void 같은_기기를_동시에_대여하면_한_명만_성공한다() throws Exception {
@@ -94,6 +116,37 @@ class RideConcurrencyIT extends RideTestSupport {
         assertThat(paymentOutboxRows(rideId)).isEqualTo(1);
         assertThat(rideRepository.find(rideId).orElseThrow().status()).isEqualTo(RideStatus.COMPLETED);
         assertThat(device(deviceId).state()).isIn(DeviceState.LOCKED, DeviceState.AVAILABLE);
+    }
+
+    @Test
+    void 락을_잃은_사이_다른_인스턴스가_먼저_확정했으면_그_결과를_돌려주고_결제_요청은_한_건이다() throws Exception {
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), PENALTY);
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId);
+        backdateStart(rideId, Duration.ofMinutes(3));
+        Ride ride = rideRepository.find(rideId).orElseThrow();
+
+        // 이 요청이 위치를 보고 요금을 계산하는 사이, 락을 잃어 함께 들어온 다른 인스턴스가 1분 먼저(서비스 구역으로) 확정한다.
+        Instant earlier = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MICROS);
+        Fare otherFare = fareCalculator.calculate(ride.tariff(), Duration.between(ride.startedAt(), earlier),
+                ZoneType.SERVICE_ZONE);
+        RideReturn otherReturn = new RideReturn(earlier, SERVICE[0], SERVICE[1], earlier, "T-SERVICE", ZoneType.SERVICE_ZONE);
+        RideTransactions racing = spy(transactions);
+        doAnswer(invocation -> {
+            assertThat(transactions.complete(ride, otherReturn, otherFare, earlier)).isTrue();
+            return invocation.callRealMethod();
+        }).when(racing).complete(any(), any(), any(), any());
+        RideService service = new RideService(distributedLock, racing, rideRepository, deviceRepository, subscriptions,
+                locationRepository, zoneIndex, fareCalculator, rideProperties, metrics, clock);
+
+        Ride result = service.returnRide(userId, rideId);
+
+        // 이 요청의 확정(벌금 구역)은 조건부 갱신에서 졌고, 먼저 확정된 결과를 그대로 돌려준다.
+        verify(racing).complete(any(), any(), any(), any());
+        assertThat(result.status()).isEqualTo(RideStatus.COMPLETED);
+        assertThat(result.returnInfo().zoneType()).isEqualTo(ZoneType.SERVICE_ZONE);
+        assertThat(result.fare()).isEqualTo(otherFare);
+        assertThat(paymentOutboxRows(rideId)).isEqualTo(1);
     }
 
     @Test
