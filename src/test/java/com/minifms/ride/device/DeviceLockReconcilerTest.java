@@ -41,7 +41,7 @@ class DeviceLockReconcilerTest {
     final VehicleCommandService commandService = mock(VehicleCommandService.class);
     final DeviceLockReconciler reconciler = new DeviceLockReconciler(devices, commandService,
             mock(VehicleCommandRepository.class), mock(DistributedLock.class),
-            new RideProperties(Duration.ofSeconds(3), Duration.ofSeconds(30), new Pricing(1_000, 150, 500, 10_000, List.of()),
+            new RideProperties(Duration.ofSeconds(3), Duration.ofSeconds(30), 3.0, new Pricing(1_000, 150, 500, 10_000, List.of()),
                     new LockReconcile(Duration.ofMillis(500), Duration.ofSeconds(1), Duration.ofSeconds(5), Duration.ofMinutes(5), 100)),
             new FmsMetrics(new SimpleMeterRegistry()), Clock.fixed(NOW, ZoneOffset.UTC));
 

@@ -19,7 +19,7 @@ class FareCalculatorTest {
             new SubscriptionPlan("PASS_UNLOCK_FREE", true, 0),
             new SubscriptionPlan("PASS_FREE", true, 100))));
 
-    final Tariff noSubscription = calculator.tariffFor(List.of());
+    final Tariff noSubscription = calculator.tariffFor(null);
 
     @Test
     void 주행_시간은_시작한_분을_올림한다() {
@@ -47,7 +47,7 @@ class FareCalculatorTest {
 
     @Test
     void 벌금_구역은_10000원을_더하고_구독권은_벌금을_깎지_않는다() {
-        Tariff pass = calculator.tariffFor(List.of("PASS_FREE"));
+        Tariff pass = calculator.tariffFor("PASS_FREE");
         Fare fare = fare(pass, Duration.ofMinutes(5), ZoneType.PENALTY_ZONE);
         // 이용요금 1,000 + 750 은 전액 면제, 벌금 10,000 은 그대로
         assertThat(fare.subscriptionDiscount()).isEqualTo(1_750);
@@ -61,24 +61,24 @@ class FareCalculatorTest {
         assertThat(normal.zoneAdjustment()).isEqualTo(-500);
         assertThat(normal.total()).isEqualTo(1_000 + 450 - 500);
 
-        Fare free = fare(calculator.tariffFor(List.of("PASS_FREE")), Duration.ofMinutes(3), ZoneType.DISCOUNT_ZONE);
+        Fare free = fare(calculator.tariffFor("PASS_FREE"), Duration.ofMinutes(3), ZoneType.DISCOUNT_ZONE);
         assertThat(free.zoneAdjustment()).as("남은 금액 0 원").isZero();
         assertThat(free.total()).isZero();
 
-        Fare almostFree = fare(calculator.tariffFor(List.of("PASS_UNLOCK_FREE")), Duration.ofMinutes(2), ZoneType.DISCOUNT_ZONE);
+        Fare almostFree = fare(calculator.tariffFor("PASS_UNLOCK_FREE"), Duration.ofMinutes(2), ZoneType.DISCOUNT_ZONE);
         assertThat(almostFree.zoneAdjustment()).as("남은 300 원까지만").isEqualTo(-300);
         assertThat(almostFree.total()).isZero();
     }
 
     @Test
     void 구독권_할인은_잠금해제료_면제와_주행요금_할인율이고_원_미만은_버린다() {
-        Fare fare = fare(calculator.tariffFor(List.of("PASS_30")), Duration.ofMinutes(7), ZoneType.SERVICE_ZONE);
+        Fare fare = fare(calculator.tariffFor("PASS_30"), Duration.ofMinutes(7), ZoneType.SERVICE_ZONE);
         // 주행 7 × 150 = 1,050 → 30% = 315
         assertThat(fare.subscriptionPlan()).isEqualTo("PASS_30");
         assertThat(fare.subscriptionDiscount()).isEqualTo(315);
         assertThat(fare.total()).isEqualTo(1_000 + 1_050 - 315);
 
-        Fare odd = fare(calculator.tariffFor(List.of("PASS_30")), Duration.ofMinutes(1), ZoneType.SERVICE_ZONE);
+        Fare odd = fare(calculator.tariffFor("PASS_30"), Duration.ofMinutes(1), ZoneType.SERVICE_ZONE);
         assertThat(odd.subscriptionDiscount()).as("150 × 30% = 45").isEqualTo(45);
         Tariff odd7 = new Tariff(1_000, 155, "X", false, 33);
         assertThat(fare(odd7, Duration.ofMinutes(1), ZoneType.SERVICE_ZONE).subscriptionDiscount())
@@ -86,12 +86,16 @@ class FareCalculatorTest {
     }
 
     @Test
-    void 구독권이_여럿이면_잠금해제료_면제를_먼저_고르고_요금표에_없는_구독권은_무시한다() {
-        assertThat(calculator.tariffFor(List.of("PASS_30", "PASS_UNLOCK_FREE")).subscriptionPlan()).isEqualTo("PASS_UNLOCK_FREE");
-        assertThat(calculator.tariffFor(List.of("PASS_UNLOCK_FREE", "PASS_FREE")).subscriptionPlan()).isEqualTo("PASS_FREE");
-        Tariff unknown = calculator.tariffFor(List.of("DISCONTINUED"));
-        assertThat(unknown.subscriptionPlan()).isNull();
-        assertThat(unknown.ridingDiscountPercent()).isZero();
+    void 구독권은_지정한_것만_쓰고_지정하지_않으면_정가다() {
+        Tariff none = calculator.tariffFor(null);
+        assertThat(none.subscriptionPlan()).isNull();
+        assertThat(none.unlockFeeWaived()).isFalse();
+        assertThat(none.ridingDiscountPercent()).isZero();
+        assertThat(calculator.tariffFor("PASS_UNLOCK_FREE").subscriptionPlan()).isEqualTo("PASS_UNLOCK_FREE");
+
+        assertThat(calculator.offersPlan("PASS_30")).isTrue();
+        assertThat(calculator.offersPlan("DISCONTINUED")).isFalse();
+        assertThatThrownBy(() -> calculator.tariffFor("DISCONTINUED")).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

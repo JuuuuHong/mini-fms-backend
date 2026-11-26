@@ -16,14 +16,17 @@ import org.springframework.validation.annotation.Validated;
 /**
  * 라이드 대여·반납·정산 설정. DB 연결(fms.ride.datasource)은 DataSourceConfig 가 따로 받는다.
  *
- * @param lockWait       같은 기기에 대한 대여·반납 분산 락을 기다리는 최대 시간. 넘으면 409.
- * @param maxLocationAge 반납 판정에 쓰는 단말 위치(측정 시각)의 최대 나이. 더 오래되면 반납을 받지 않는다.
+ * @param lockWait          같은 기기에 대한 대여·반납 분산 락을 기다리는 최대 시간. 넘으면 409.
+ * @param maxLocationAge    대여·반납 판정에 쓰는 단말 위치(측정 시각)의 최대 나이. 더 오래되면 받지 않는다.
+ * @param returnMaxSpeedKmh 반납을 받는 단말 보고 속도의 상한(km/h). 더 빠르면 아직 움직이는 중이라 그 위치로 판정하지 않는다
+ *                          (지나온 구역으로 판정되는 것을 막는다). 정차 중 GPS 속도 흔들림을 넘는 값으로 둔다.
  */
 @Validated
 @ConfigurationProperties(prefix = "fms.ride")
 public record RideProperties(
         @DefaultValue("3s") Duration lockWait,
         @DefaultValue("30s") Duration maxLocationAge,
+        @DefaultValue("3") @PositiveOrZero double returnMaxSpeedKmh,
         @Valid @DefaultValue Pricing pricing,
         @Valid @DefaultValue LockReconcile lockReconcile) {
 

@@ -49,7 +49,7 @@ class RideConcurrencyIT extends RideTestSupport {
     void 같은_기기를_동시에_대여하면_한_명만_성공한다() throws Exception {
         String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
 
-        List<Object> results = race(THREADS, i -> rideService.rent(TestEvents.uniqueId("user"), deviceId));
+        List<Object> results = race(THREADS, i -> rideService.rent(TestEvents.uniqueId("user"), deviceId, null));
 
         assertThat(results.stream().filter(Ride.class::isInstance)).hasSize(1);
         assertThat(results.stream().filter(ConflictException.class::isInstance)).hasSize(THREADS - 1);
@@ -102,7 +102,7 @@ class RideConcurrencyIT extends RideTestSupport {
         Instant now = Instant.now();
         List<Object> sameDevice = race(THREADS, i -> {
             transactions.start(Ride.start(UUID.randomUUID(), TestEvents.uniqueId("user"), deviceId, now,
-                    fareCalculator.tariffFor(List.of())));
+                    fareCalculator.tariffFor(null)));
             return "started";
         });
         assertThat(sameDevice.stream().filter("started"::equals)).hasSize(1);
@@ -114,7 +114,7 @@ class RideConcurrencyIT extends RideTestSupport {
         for (int i = 0; i < THREADS; i++) {
             devices.add(registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE));
         }
-        List<Object> sameUser = race(THREADS, i -> rideService.rent(userId, devices.get(i)));
+        List<Object> sameUser = race(THREADS, i -> rideService.rent(userId, devices.get(i), null));
         assertThat(sameUser.stream().filter(Ride.class::isInstance)).hasSize(1);
         assertThat(sameUser.stream().filter(ConflictException.class::isInstance))
                 .allSatisfy(e -> assertThat(((ConflictException) e).properties()).containsEntry("reason", "ACTIVE_RIDE_EXISTS"))
@@ -139,7 +139,7 @@ class RideConcurrencyIT extends RideTestSupport {
         try {
             assertThat(locked.await(5, TimeUnit.SECONDS)).isTrue();
             long started = System.nanoTime();
-            assertThatThrownBy(() -> rideService.rent(TestEvents.uniqueId("user"), deviceId))
+            assertThatThrownBy(() -> rideService.rent(TestEvents.uniqueId("user"), deviceId, null))
                     .isInstanceOfSatisfying(ConflictException.class, e ->
                             assertThat(e.properties()).isEqualTo(Map.of("deviceId", deviceId, "reason", "REQUEST_IN_PROGRESS")));
             assertThat(Duration.ofNanos(System.nanoTime() - started)).as("lock-wait(1초)만큼 기다린다")
@@ -151,7 +151,7 @@ class RideConcurrencyIT extends RideTestSupport {
             holder.shutdown();
         }
         // 락이 풀리면 대여된다.
-        assertThat(rideService.rent(TestEvents.uniqueId("user"), deviceId).status()).isEqualTo(RideStatus.IN_PROGRESS);
+        assertThat(rideService.rent(TestEvents.uniqueId("user"), deviceId, null).status()).isEqualTo(RideStatus.IN_PROGRESS);
     }
 
     private long activeRides(String deviceId) {

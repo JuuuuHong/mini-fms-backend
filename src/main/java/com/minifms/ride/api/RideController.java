@@ -22,7 +22,7 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * 라이드 API(이용자 앱, ride:write). 이용자는 토큰의 subject 다.
  * <pre>
- *   POST /api/v1/rides                    대여 → 201 + Location
+ *   POST /api/v1/rides                    대여(구독권은 지정한 것만) → 201 + Location
  *   POST /api/v1/rides/{rideId}/return    반납 → 200 (확정 요금). 같은 요청을 다시 보내도 같은 결과(멱등)
  *   GET  /api/v1/rides/{rideId}           본인 라이드(ride:write) 또는 모든 라이드(fleet:read)
  * </pre>
@@ -41,7 +41,7 @@ public class RideController {
 
     @PostMapping
     public ResponseEntity<Ride> rent(Authentication authentication, @Valid @RequestBody RentRequest request) {
-        Ride ride = rideService.rent(userId(authentication), request.deviceId());
+        Ride ride = rideService.rent(userId(authentication), request.deviceId(), request.subscriptionPlan());
         return ResponseEntity.created(URI.create("/api/v1/rides/" + ride.rideId())).body(ride);
     }
 
@@ -66,6 +66,11 @@ public class RideController {
         return subject;
     }
 
-    public record RentRequest(@NotBlank @Pattern(regexp = DEVICE_ID_PATTERN) String deviceId) {
+    /**
+     * @param subscriptionPlan 이번 대여에 쓸 구독권 코드(선택). 지정하지 않으면 정가다. 가진 구독권 중에서 이용자가 고른다.
+     */
+    public record RentRequest(
+            @NotBlank @Pattern(regexp = DEVICE_ID_PATTERN) String deviceId,
+            @Pattern(regexp = "^[A-Z0-9_]{1,32}$") String subscriptionPlan) {
     }
 }

@@ -98,7 +98,7 @@ class RideSettlementIT extends RideTestSupport {
         Instant now = Instant.now();
         subscribe(userId, "PASS_30", now.minus(Duration.ofDays(1)), now.plus(Duration.ofDays(29)));
 
-        UUID rideId = rent(userId, deviceId);
+        UUID rideId = rent(userId, deviceId, "PASS_30");
         // 대여 뒤 구독권이 끝나도 대여할 때의 조건으로 정산한다.
         rideJdbcClient.sql("UPDATE subscriptions SET ends_at = :past WHERE user_id = :userId")
                 .param("past", Timestamp.from(now.minusSeconds(1))).param("userId", userId).update();
@@ -116,10 +116,107 @@ class RideSettlementIT extends RideTestSupport {
     }
 
     @Test
-    void 반납_불가_구역에서는_거절하고_라이드는_계속되며_옮긴_뒤에는_반납된다() throws Exception {
-        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), NO_RETURN);
+    void 구독권은_대여할_때_지정한_것만_쓴다() throws Exception {
+        Instant now = Instant.now();
+        String expiredUser = TestEvents.uniqueId("user");
+        subscribe(expiredUser, "PASS_30", now.minus(Duration.ofDays(31)), now.minus(Duration.ofDays(1)));
+
+        // 구독권이 둘 있어도 지정하지 않으면 정가다(서버가 대신 고르지 않는다).
+        String undecided = userWithTwoPasses(now);
+        rentRequest(undecided, registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE)).andExpect(status().isCreated())
+                .andExpect(jsonPath("$.tariff.subscriptionPlan").doesNotExist())
+                .andExpect(jsonPath("$.tariff.unlockFeeWaived").value(false))
+                .andExpect(jsonPath("$.tariff.ridingDiscountPercent").value(0));
+
+        // 지정한 구독권(둘 중 잠금해제료 면제)을 스냅샷한다.
+        rentRequest(userWithTwoPasses(now), registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE), "PASS_UNLOCK_FREE")
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.tariff.subscriptionPlan").value("PASS_UNLOCK_FREE"))
+                .andExpect(jsonPath("$.tariff.unlockFeeWaived").value(true))
+                .andExpect(jsonPath("$.tariff.ridingDiscountPercent").value(0));
+
+        // 쓸 수 없는 구독권을 지정하면 정가로 바꿔 대여하지 않고 거절한다(기기는 그대로 AVAILABLE).
+        String other = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        rentRequest(expiredUser, other, "PASS_30")
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("SUBSCRIPTION_NOT_ACTIVE"));
+        rentRequest(TestEvents.uniqueId("user"), other, "PASS_30")
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("SUBSCRIPTION_NOT_ACTIVE"));
+        rentRequest(expiredUser, other, "PASS_GOLD")
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("SUBSCRIPTION_PLAN_UNKNOWN"));
+        rentRequest(expiredUser, other, "pass 30").andExpect(status().isBadRequest());
+        assertThat(device(other).state()).isEqualTo(DeviceState.AVAILABLE);
+    }
+
+    @Test
+    void 합계가_0원이면_라이드는_확정하되_결제_요청은_만들지_않는다() throws Exception {
+        Instant now = Instant.now();
+        String userId = TestEvents.uniqueId("user");
+        subscribe(userId, "PASS_UNLOCK_FREE", now.minus(Duration.ofDays(1)), now.plus(Duration.ofDays(29)));
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), DISCOUNT);
+        UUID freeRide = rent(userId, deviceId, "PASS_UNLOCK_FREE");
+        backdateStart(freeRide, Duration.ofMinutes(1).plusSeconds(30));
+
+        // 잠금해제료 1,000 면제, 주행 2분 300, 주차 권장 −500 은 남은 300 까지만 → 0
+        returnRequest(userId, freeRide)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.fare.subscriptionDiscount").value(1_000))
+                .andExpect(jsonPath("$.fare.zoneAdjustment").value(-300))
+                .andExpect(jsonPath("$.fare.total").value(0));
+        assertThat(paymentOutboxRows(freeRide)).isZero();
+        assertThat(device(deviceId).state()).isIn(DeviceState.LOCKED, DeviceState.AVAILABLE);
+
+        // 뒤에 확정한 유료 라이드의 결제 요청이 나온 뒤에도 0원 라이드의 결제 요청은 없다.
+        String paidUser = TestEvents.uniqueId("user");
+        String paidDevice = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        UUID paidRide = rent(paidUser, paidDevice);
+        backdateStart(paidRide, Duration.ofMinutes(1));
+        returnRequest(paidUser, paidRide).andExpect(status().isOk());
+        try (KafkaTopicProbe probe = new KafkaTopicProbe(bootstrapServers(), topics.paymentRequests())) {
+            List<ConsumerRecord<String, String>> records = probe.pollUntil(
+                    received -> received.stream().anyMatch(r -> paidRide.toString().equals(r.key())), Duration.ofSeconds(20));
+            assertThat(records).anyMatch(r -> paidRide.toString().equals(r.key()));
+            assertThat(records).noneMatch(r -> freeRide.toString().equals(r.key()));
+        }
+    }
+
+    @Test
+    void 반납은_대여한_뒤에_측정한_정차_위치로만_판정한다() throws Exception {
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
         String userId = TestEvents.uniqueId("user");
         UUID rideId = rent(userId, deviceId);
+
+        // 대여 전에 보낸 위치뿐이다(30초 안이라 신선하지만 이번 라이드가 끝난 자리를 말해 주지 않는다).
+        returnRequest(userId, rideId)
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("LOCATION_BEFORE_RIDE_START"));
+
+        // 서비스 구역을 달리는 중의 보고로는 판정하지 않는다(다음 보고 때 이미 옆 벌금 구역일 수 있다).
+        report(deviceId, SERVICE, 15.0, System.currentTimeMillis() + 1);
+        returnRequest(userId, rideId)
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason").value("DEVICE_MOVING"))
+                .andExpect(jsonPath("$.speedKmh").value(15.0));
+        assertThat(device(deviceId).state()).isEqualTo(DeviceState.IN_USE);
+        assertThat(paymentOutboxRows(rideId)).isZero();
+
+        // 벌금 구역에 세운 보고가 오면 그 자리로 판정한다. 정차 중 GPS 흔들림(3km/h 이하)은 정차로 본다.
+        report(deviceId, PENALTY, 2.5, System.currentTimeMillis() + 2);
+        returnRequest(userId, rideId)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.returnInfo.zoneType").value("PENALTY_ZONE"))
+                .andExpect(jsonPath("$.fare.zoneAdjustment").value(10_000));
+    }
+
+    @Test
+    void 반납_불가_구역에서는_거절하고_라이드는_계속되며_옮긴_뒤에는_반납된다() throws Exception {
+        String deviceId = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        String userId = TestEvents.uniqueId("user");
+        UUID rideId = rent(userId, deviceId);
+        reportStopped(deviceId, NO_RETURN);
 
         returnRequest(userId, rideId)
                 .andExpect(status().isUnprocessableEntity())
@@ -139,7 +236,9 @@ class RideSettlementIT extends RideTestSupport {
     @Test
     void 서비스_지역_밖이거나_위치가_오래되면_반납하지_않는다() throws Exception {
         String outsideUser = TestEvents.uniqueId("user");
-        UUID outsideRide = rent(outsideUser, registerDeviceAt(TestEvents.uniqueId("KB"), OUTSIDE));
+        String outsideDevice = registerDeviceAt(TestEvents.uniqueId("KB"), SERVICE);
+        UUID outsideRide = rent(outsideUser, outsideDevice);
+        reportStopped(outsideDevice, OUTSIDE);
         returnRequest(outsideUser, outsideRide)
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason").value("OUT_OF_SERVICE_AREA"));
@@ -258,6 +357,7 @@ class RideSettlementIT extends RideTestSupport {
         String deviceId = registerDeviceAt("T-RIDE-NORESP", SERVICE);
         String userId = TestEvents.uniqueId("user");
         UUID rideId = rent(userId, deviceId);
+        reportStopped(deviceId, SERVICE);
         returnRequest(userId, rideId).andExpect(status().isOk());
 
         // 응답 마감 2초 → TIMEOUT → 백오프 뒤 새 잠금 명령
@@ -277,17 +377,15 @@ class RideSettlementIT extends RideTestSupport {
         }
     }
 
-    private ResultActions getRide(String userId, UUID rideId) throws Exception {
-        return mockMvc.perform(get("/api/v1/rides/{id}", rideId).with(asRider(userId)));
+    private String userWithTwoPasses(Instant now) {
+        String userId = TestEvents.uniqueId("user");
+        subscribe(userId, "PASS_30", now.minus(Duration.ofDays(1)), now.plus(Duration.ofDays(29)));
+        subscribe(userId, "PASS_UNLOCK_FREE", now.minus(Duration.ofDays(1)), now.plus(Duration.ofDays(29)));
+        return userId;
     }
 
-    private void subscribe(String userId, String plan, Instant startsAt, Instant endsAt) {
-        rideJdbcClient.sql("""
-                        INSERT INTO subscriptions (user_id, plan_code, starts_at, ends_at)
-                        VALUES (:userId, :plan, :startsAt, :endsAt)""")
-                .param("userId", userId).param("plan", plan)
-                .param("startsAt", Timestamp.from(startsAt)).param("endsAt", Timestamp.from(endsAt))
-                .update();
+    private ResultActions getRide(String userId, UUID rideId) throws Exception {
+        return mockMvc.perform(get("/api/v1/rides/{id}", rideId).with(asRider(userId)));
     }
 
     private JsonNode awaitPaymentRequest(UUID rideId) throws Exception {

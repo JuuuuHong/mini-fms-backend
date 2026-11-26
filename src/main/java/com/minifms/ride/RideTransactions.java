@@ -56,7 +56,8 @@ public class RideTransactions {
 
     /**
      * 반납 확정: 라이드 IN_PROGRESS → COMPLETED + 기기 IN_USE → LOCKED + 결제 요청 아웃박스 적재.
-     * 셋이 함께 커밋되거나 함께 롤백된다.
+     * 셋이 함께 커밋되거나 함께 롤백된다. 합계가 0원이면 청구할 것이 없으므로 결제 요청을 만들지 않는다
+     * (PG 는 0원 승인을 받지 않는다). 0원 라이드는 라이드 기록의 total_fare = 0 으로만 남는다.
      *
      * @return 이번 호출이 확정했으면 true. 다른 요청이 이미 확정했으면 false(아무것도 바꾸지 않음).
      */
@@ -69,6 +70,9 @@ public class RideTransactions {
                 // 라이드는 진행 중인데 기기가 그 라이드의 IN_USE 가 아니다 — 같은 트랜잭션으로만 바꾸므로 생기면 안 되는 상태.
                 throw new IllegalStateException("기기 상태가 라이드와 맞지 않습니다 rideId=" + ride.rideId()
                         + " deviceId=" + ride.deviceId());
+            }
+            if (fare.total() == 0) {
+                return true;
             }
             Ride completedRide = new Ride(ride.rideId(), ride.userId(), ride.deviceId(), RideStatus.COMPLETED,
                     ride.startedAt(), ride.tariff(), ret, fare);

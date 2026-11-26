@@ -34,9 +34,9 @@ import org.springframework.stereotype.Service;
  * 대여·반납 오케스트레이션.
  *
  * <pre>
- * 대여: [기기 락] 기기·사용자·단말 위치(신선도) 확인 → 요금표·구독권 스냅샷 → TX{ 기기 AVAILABLE→IN_USE, 라이드 생성 }
- * 반납: [기기 락] 단말 최신 위치(신선도) → 구역 판정 → 요금 계산
- *              → TX{ 라이드 COMPLETED, 기기 IN_USE→LOCKED, 결제 요청 아웃박스 }
+ * 대여: [기기 락] 기기·사용자·지정한 구독권·단말 위치(신선도) 확인 → 요금표·구독권 스냅샷 → TX{ 기기 AVAILABLE→IN_USE, 라이드 생성 }
+ * 반납: [기기 락] 단말 최신 위치(신선도·대여 뒤 측정·정차) → 구역 판정 → 요금 계산
+ *              → TX{ 라이드 COMPLETED, 기기 IN_USE→LOCKED, 결제 요청 아웃박스(합계 0원이면 없음) }
  *       이후 잠금 명령 발송·확인은 DeviceLockReconciler, 결제 요청 발행은 PaymentOutboxRelay 가 비동기로 한다.
  * </pre>
  *
@@ -82,7 +82,10 @@ public class RideService {
         return "fms:lock:device:" + deviceId;
     }
 
-    public Ride rent(String userId, String deviceId) {
+    /**
+     * @param subscriptionPlan 이용자가 이번 대여에 쓰겠다고 지정한 구독권 코드(없으면 null, 정가)
+     */
+    public Ride rent(String userId, String deviceId, String subscriptionPlan) {
         return withDeviceLock(deviceId, () -> {
             Device device = devices.find(deviceId)
                     .orElseThrow(() -> new NotFoundException("등록되지 않은 기기입니다: " + deviceId));
@@ -97,10 +100,10 @@ public class RideService {
             }
 
             Instant now = now();
+            Tariff tariff = tariffFor(userId, subscriptionPlan, now);
             // 반납은 단말의 최신 위치로만 판정한다. 지금 위치를 보고하지 않는 기기를 빌려주면 반납할 수 없는 라이드가 생기고
             // 그동안 주행 요금이 쌓이므로, 반납과 같은 신선도 기준을 대여에도 건다.
             freshLocation(deviceId, now, "대여");
-            Tariff tariff = fareCalculator.tariffFor(subscriptions.findActivePlanCodes(userId, now));
             Ride ride = Ride.start(UUID.randomUUID(), userId, deviceId, now, tariff);
             try {
                 transactions.start(ride);
@@ -133,7 +136,7 @@ public class RideService {
             Instant now = now();
             VehicleSnapshot location;
             try {
-                location = freshLocation(current.deviceId(), now, "반납");
+                location = returnLocation(current, now);
             } catch (UnprocessableException e) {
                 metrics.rideReturnRejected(String.valueOf(e.properties().get("reason")));
                 throw e;
@@ -158,8 +161,8 @@ public class RideService {
                     zone.zoneId(), zone.zoneType());
             if (transactions.complete(current, ret, fare, now)) {
                 metrics.rideReturned(zone.zoneType().name());
-                log.info("반납 rideId={} deviceId={} zone={}({}) minutes={} total={}", rideId, current.deviceId(),
-                        zone.zoneId(), zone.zoneType(), fare.ridingMinutes(), fare.total());
+                log.info("반납 rideId={} deviceId={} zone={}({}) minutes={} total={} paymentRequest={}", rideId,
+                        current.deviceId(), zone.zoneId(), zone.zoneType(), fare.ridingMinutes(), fare.total(), fare.total() > 0);
             } else {
                 log.warn("다른 요청이 먼저 반납을 확정했습니다(분산 락 경합) rideId={}", rideId);
             }
@@ -178,6 +181,49 @@ public class RideService {
         return rides.find(rideId)
                 .filter(ride -> ride.userId().equals(userId))
                 .orElseThrow(() -> new NotFoundException("라이드를 찾을 수 없습니다: " + rideId));
+    }
+
+    /**
+     * 이용자가 지정한 구독권으로 대여 시점 스냅샷을 만든다. 지정하지 않았으면 정가다(가진 구독권을 자동으로 고르지 않는다).
+     * 요금표에 없거나 지금 유효하지 않은 구독권이면 422 — 이용자가 고른 할인을 조용히 빼고 정가로 대여하지 않는다.
+     */
+    private Tariff tariffFor(String userId, String subscriptionPlan, Instant now) {
+        if (subscriptionPlan == null) {
+            return fareCalculator.tariffFor(null);
+        }
+        if (!fareCalculator.offersPlan(subscriptionPlan)) {
+            throw new UnprocessableException("판매하지 않는 구독권입니다: " + subscriptionPlan,
+                    Map.of("reason", "SUBSCRIPTION_PLAN_UNKNOWN", "subscriptionPlan", subscriptionPlan));
+        }
+        if (!subscriptions.hasActive(userId, subscriptionPlan, now)) {
+            throw new UnprocessableException("지금 쓸 수 있는 구독권이 아닙니다: " + subscriptionPlan,
+                    Map.of("reason", "SUBSCRIPTION_NOT_ACTIVE", "subscriptionPlan", subscriptionPlan));
+        }
+        return fareCalculator.tariffFor(subscriptionPlan);
+    }
+
+    /**
+     * 반납 판정에 쓸 단말 위치. 신선도(maxLocationAge)에 더해 두 가지를 요구한다.
+     * <ul>
+     *   <li>대여한 뒤에 측정한 위치 — 대여 전 보고로는 이번 라이드가 끝난 자리를 알 수 없다(짧은 라이드에서 생긴다).</li>
+     *   <li>정차 중(속도 ≤ returnMaxSpeedKmh) — 움직이는 중의 보고는 다음 보고 때 이미 다른 자리다. 서비스 구역을 지나며
+     *       보낸 보고로 바로 옆 벌금·반납 불가 구역의 반납을 판정하지 않는다.</li>
+     * </ul>
+     * 셋 다 단말이 곧 새 위치를 보내면 풀리므로 422(잠시 뒤 재시도)다. 측정 시각은 단말 시계(GPS 시각)다.
+     */
+    private VehicleSnapshot returnLocation(Ride ride, Instant now) {
+        VehicleSnapshot location = freshLocation(ride.deviceId(), now, "반납");
+        if (location.timestamp().isBefore(ride.startedAt())) {
+            throw new UnprocessableException("대여한 뒤의 기기 위치가 아직 없어 반납할 수 없습니다. 잠시 뒤 다시 시도하세요.",
+                    Map.of("reason", "LOCATION_BEFORE_RIDE_START", "locationMeasuredAt", location.timestamp().toString(),
+                            "startedAt", ride.startedAt().toString()));
+        }
+        if (location.speed() > properties.returnMaxSpeedKmh()) {
+            throw new UnprocessableException("기기가 움직이는 중이라 반납할 수 없습니다. 세운 뒤 다시 시도하세요.",
+                    Map.of("reason", "DEVICE_MOVING", "speedKmh", location.speed(),
+                            "maxSpeedKmh", properties.returnMaxSpeedKmh()));
+        }
+        return location;
     }
 
     /** 단말이 maxLocationAge 안에 보고한 최신 위치. 없거나 오래됐으면 422(action = "대여" | "반납"). */

@@ -2,7 +2,6 @@ package com.minifms.ride;
 
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.util.List;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
@@ -16,14 +15,16 @@ public class SubscriptionRepository {
         this.jdbc = rideJdbcClient;
     }
 
-    /** at 시점에 유효한 구독권 코드([starts_at, ends_at)). */
-    public List<String> findActivePlanCodes(String userId, Instant at) {
+    /** 이용자가 at 시점에 유효한([starts_at, ends_at)) 이 구독권을 갖고 있는가. */
+    public boolean hasActive(String userId, String planCode, Instant at) {
         return jdbc.sql("""
-                        SELECT DISTINCT plan_code FROM subscriptions
-                        WHERE user_id = :userId AND starts_at <= :at AND ends_at > :at""")
+                        SELECT EXISTS (SELECT 1 FROM subscriptions
+                                       WHERE user_id = :userId AND plan_code = :planCode
+                                         AND starts_at <= :at AND ends_at > :at)""")
                 .param("userId", userId)
+                .param("planCode", planCode)
                 .param("at", Timestamp.from(at))
-                .query(String.class)
-                .list();
+                .query(Boolean.class)
+                .single();
     }
 }

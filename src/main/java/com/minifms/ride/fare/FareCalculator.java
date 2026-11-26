@@ -5,11 +5,6 @@ import com.minifms.common.config.properties.RideProperties.Pricing;
 import com.minifms.common.config.properties.RideProperties.SubscriptionPlan;
 import com.minifms.ride.zone.ZoneType;
 import java.time.Duration;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -28,7 +23,6 @@ import org.springframework.stereotype.Component;
 @Component
 public class FareCalculator {
 
-    private static final Logger log = LoggerFactory.getLogger(FareCalculator.class);
     private static final long NANOS_PER_MINUTE = 60_000_000_000L;
 
     private final Pricing pricing;
@@ -42,31 +36,25 @@ public class FareCalculator {
         this.pricing = pricing;
     }
 
+    /** 요금표가 이 구독권을 아는가(판매를 멈춘 구독권이면 false). */
+    public boolean offersPlan(String planCode) {
+        return pricing.plan(planCode).isPresent();
+    }
+
     /**
-     * 지금 요금표와 사용자의 유효한 구독권으로 대여 시점 스냅샷을 만든다. 구독권이 여러 개면 할인이 큰 쪽 하나를 쓴다
-     * (잠금해제료 면제를 먼저, 같으면 할인율이 큰 쪽).
+     * 지금 요금표로 대여 시점 스냅샷을 만든다. 구독권은 이용자가 대여할 때 지정한 것 하나만 쓴다(자동으로 고르지 않는다).
      *
-     * @param activePlanCodes 대여 시점에 유효한 구독권 코드들. 요금표에 없는 코드는 경고를 남기고 무시한다.
+     * @param planCode 이용자가 지정한 구독권 코드. 없으면 null(정가).
+     * @throws IllegalArgumentException 요금표에 없는 구독권({@link #offersPlan} 으로 먼저 확인한다)
      */
-    public Tariff tariffFor(Collection<String> activePlanCodes) {
-        Optional<SubscriptionPlan> best = activePlanCodes.stream()
-                .map(code -> {
-                    Optional<SubscriptionPlan> plan = pricing.plan(code);
-                    if (plan.isEmpty()) {
-                        log.warn("요금표에 없는 구독권이라 할인을 적용하지 않습니다 plan={}", code);
-                    }
-                    return plan;
-                })
-                .flatMap(Optional::stream)
-                .max(Comparator.comparing(SubscriptionPlan::unlockFeeWaived)
-                        .thenComparingInt(SubscriptionPlan::ridingDiscountPercent)
-                        .thenComparing(SubscriptionPlan::code, Comparator.reverseOrder()));
-        return new Tariff(
-                pricing.unlockFee(),
-                pricing.perMinuteFee(),
-                best.map(SubscriptionPlan::code).orElse(null),
-                best.map(SubscriptionPlan::unlockFeeWaived).orElse(false),
-                best.map(SubscriptionPlan::ridingDiscountPercent).orElse(0));
+    public Tariff tariffFor(String planCode) {
+        if (planCode == null) {
+            return new Tariff(pricing.unlockFee(), pricing.perMinuteFee(), null, false, 0);
+        }
+        SubscriptionPlan plan = pricing.plan(planCode)
+                .orElseThrow(() -> new IllegalArgumentException("요금표에 없는 구독권입니다: " + planCode));
+        return new Tariff(pricing.unlockFee(), pricing.perMinuteFee(), plan.code(), plan.unlockFeeWaived(),
+                plan.ridingDiscountPercent());
     }
 
     /**

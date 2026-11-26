@@ -165,14 +165,17 @@ fms:
       connection-timeout: 3000
     # 같은 기기에 대한 대여·반납 분산 락(Redisson)을 기다리는 최대 시간. 넘으면 409.
     lock-wait: 3s
-    # 반납 판정에 쓰는 단말 위치(측정 시각)가 이보다 오래되면 반납을 받지 않는다(422).
+    # 대여·반납 판정에 쓰는 단말 위치(측정 시각)가 이보다 오래되면 받지 않는다(422).
     max-location-age: 30s
+    # 반납은 대여 뒤에 측정한, 이 속도(km/h) 이하로 정차한 보고로만 판정한다(422 DEVICE_MOVING). 정차 중 GPS 흔들림보다 크게 둔다.
+    return-max-speed-kmh: 3
     pricing:
       unlock-fee: 1000
       per-minute-fee: 150
       discount-zone-amount: 500
       penalty-zone-amount: 10000
       # 구독권 할인 = 잠금해제료 면제분 + 주행요금 × 할인율. 구역 벌금에는 적용하지 않는다.
+      # 이용자가 대여할 때 쓸 구독권을 지정한다(subscriptionPlan). 지정하지 않으면 정가다.
       subscription-plans:
         - code: PASS_30
           riding-discount-percent: 30

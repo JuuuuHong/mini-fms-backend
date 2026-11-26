@@ -12,7 +12,9 @@ import com.minifms.support.IntegrationTestSupport;
 import com.minifms.telematics.domain.EngineStatus;
 import com.minifms.telematics.domain.TelematicsEvent;
 import com.minifms.vehicle.location.VehicleLocationRepository;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
@@ -58,21 +60,44 @@ abstract class RideTestSupport extends IntegrationTestSupport {
         return deviceId;
     }
 
-    /** 단말이 측정 시각 timestamp 에 이 좌표를 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
+    /** 단말이 측정 시각 timestamp 에 이 좌표에 정차해 있다고 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
     void moveTo(String deviceId, double[] position, long timestamp) {
-        locationRepository.updateIfNewer(
-                new TelematicsEvent(deviceId, position[0], position[1], 0.0, 80.0, EngineStatus.OFF, timestamp),
-                System.currentTimeMillis());
+        report(deviceId, position, 0.0, timestamp);
+    }
+
+    /** 단말이 측정 시각 timestamp 에 이 좌표·속도(km/h)를 보고한 것으로 만든다(더 최신 시각일 때만 반영). */
+    void report(String deviceId, double[] position, double speedKmh, long timestamp) {
+        locationRepository.updateIfNewer(new TelematicsEvent(deviceId, position[0], position[1], speedKmh, 80.0,
+                speedKmh > 0 ? EngineStatus.ON : EngineStatus.OFF, timestamp), System.currentTimeMillis());
+    }
+
+    /**
+     * 대여한 뒤 단말이 이 좌표에 정차했다고 보고한다. 반납은 대여 뒤에 측정한 정차 위치로만 판정한다.
+     * 측정 시각은 밀리초, 대여 시각은 마이크로초라 같은 밀리초 안이면 대여 전으로 보일 수 있어 1ms 뒤로 둔다.
+     */
+    void reportStopped(String deviceId, double[] position) {
+        moveTo(deviceId, position, System.currentTimeMillis() + 1);
     }
 
     ResultActions rentRequest(String userId, String deviceId) throws Exception {
+        return rentRequest(userId, deviceId, null);
+    }
+
+    ResultActions rentRequest(String userId, String deviceId, String subscriptionPlan) throws Exception {
+        String body = subscriptionPlan == null
+                ? "{\"deviceId\":\"" + deviceId + "\"}"
+                : "{\"deviceId\":\"" + deviceId + "\",\"subscriptionPlan\":\"" + subscriptionPlan + "\"}";
         return mockMvc.perform(post("/api/v1/rides").with(asRider(userId))
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"deviceId\":\"" + deviceId + "\"}"));
+                .content(body));
     }
 
     UUID rent(String userId, String deviceId) throws Exception {
-        String body = rentRequest(userId, deviceId).andExpect(status().isCreated())
+        return rent(userId, deviceId, null);
+    }
+
+    UUID rent(String userId, String deviceId, String subscriptionPlan) throws Exception {
+        String body = rentRequest(userId, deviceId, subscriptionPlan).andExpect(status().isCreated())
                 .andReturn().getResponse().getContentAsString();
         return UUID.fromString(JsonPath.read(body, "$.rideId"));
     }
@@ -86,6 +111,16 @@ abstract class RideTestSupport extends IntegrationTestSupport {
         rideJdbcClient.sql("UPDATE rides SET started_at = started_at - CAST(:interval AS interval) WHERE ride_id = :id")
                 .param("interval", rideLength.toMillis() + " milliseconds")
                 .param("id", rideId)
+                .update();
+    }
+
+    /** 이용자에게 [startsAt, endsAt) 동안 유효한 구독권을 준다(판매는 범위 밖이라 테이블에 직접 넣는다). */
+    void subscribe(String userId, String plan, Instant startsAt, Instant endsAt) {
+        rideJdbcClient.sql("""
+                        INSERT INTO subscriptions (user_id, plan_code, starts_at, ends_at)
+                        VALUES (:userId, :plan, :startsAt, :endsAt)""")
+                .param("userId", userId).param("plan", plan)
+                .param("startsAt", Timestamp.from(startsAt)).param("endsAt", Timestamp.from(endsAt))
                 .update();
     }
 
