@@ -104,6 +104,10 @@ class VehicleCommandUncertaintyIT extends IntegrationTestSupport {
     void 성공_ACK_와_마감_처리가_경합해도_종료_상태는_한_번만_확정되고_제어_상태와_보상_이벤트가_일치한다() throws Exception {
         int count = 30;
         long now = clock.millis();
+        // 기준값은 명령을 만들기 전에 잰다. 만드는 동안에도 마감 스케줄러(0.2초 주기)가 이미 마감이 지난 명령을 TIMEOUT 으로
+        // 확정할 수 있어, 만든 뒤에 재면 그 확정이 기준값에 들어가 증가분이 30 보다 작게 나온다.
+        double lateAcksBefore = metrics.count(FmsMetrics.COMMAND_LATE_ACKS);
+        double finishedBefore = finishedEngineStops();
         Map<String, String> vehicleOf = new HashMap<>();
         for (int i = 0; i < count; i++) {
             String vehicleId = seedVehicle(TestEvents.uniqueId("RACE"));
@@ -114,8 +118,6 @@ class VehicleCommandUncertaintyIT extends IntegrationTestSupport {
                     Duration.ofSeconds(10), Duration.ofHours(1));
             vehicleOf.put(commandId, vehicleId);
         }
-        double lateAcksBefore = metrics.count(FmsMetrics.COMMAND_LATE_ACKS);
-        double finishedBefore = finishedEngineStops();
 
         // 명령마다 "성공 ACK 처리"와 "마감 처리"를 같은 순간에 출발시킨다(스케줄러도 0.2초마다 끼어든다).
         ExecutorService pool = Executors.newFixedThreadPool(8);
