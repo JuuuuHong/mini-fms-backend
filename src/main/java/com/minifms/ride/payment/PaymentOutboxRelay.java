@@ -4,13 +4,17 @@ import com.minifms.common.config.properties.PaymentOutboxProperties;
 import com.minifms.common.metrics.FmsMetrics;
 import com.minifms.ride.payment.PaymentOutboxRepository.OutboxRow;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.scheduling.annotation.SchedulingConfigurer;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 import org.springframework.stereotype.Component;
@@ -27,8 +31,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>한 주기 = 한 트랜잭션: 미발행 행을 {@code FOR UPDATE SKIP LOCKED} 로 잠그고 → 모두 보낸 뒤 → 브로커 확인(acks=all)이
  *       온 행만 published_at 을 찍고 커밋한다. 확인되지 않은 행은 다음 주기에 다시 보낸다.</li>
  *   <li>여러 인스턴스가 함께 돌아도 잠긴 행은 서로 건너뛰므로 같은 행을 동시에 보내지 않는다(잠금 서버 불필요).</li>
- *   <li>보낸 뒤 확인 전에 프로세스가 죽으면 트랜잭션이 롤백돼 다시 보낸다 — 중복은 가능, 유실은 없다.
- *       소비자는 eventId·idempotencyKey 로 거른다.</li>
+ *   <li>확인은 프로듀서가 성패를 알려 줄 때까지(delivery.timeout.ms) 기다린다. 더 일찍 포기하면 프로듀서가 아직 재전송 중인
+ *       레코드의 행 잠금을 풀어, 다음 주기가 같은 행을 또 보내 사본이 쌓인다. 그래서 기동할 때 sendTimeout 이 더 긴지 확인한다.</li>
+ *   <li>보낸 뒤 확인 전에 프로세스가 죽거나, 프로듀서가 끝내 실패를 알린 레코드가 사실은 기록됐으면 다시 보낸다 —
+ *       중복은 가능, 유실은 없다. 소비자는 eventId·idempotencyKey 로 거른다.</li>
  *   <li>라이드당 결제 이벤트는 하나라 행끼리의 순서는 의미가 없다(키 = rideId).</li>
  * </ul>
  */
@@ -53,6 +59,27 @@ public class PaymentOutboxRelay implements SchedulingConfigurer {
         this.properties = properties;
         this.metrics = metrics;
         this.clock = clock;
+        ProducerFactory<String, String> producerFactory = kafkaTemplate.getProducerFactory();
+        if (producerFactory != null) { // 테스트의 가짜 KafkaTemplate 에는 없다
+            requireSendTimeoutCoversDelivery(properties.sendTimeout(), producerFactory.getConfigurationProperties());
+        }
+    }
+
+    /**
+     * 확인 대기(sendTimeout)가 프로듀서가 레코드의 성패를 알려 주는 상한(delivery.timeout.ms)보다 길어야 한다.
+     * 짧으면 브로커가 잠시 느릴 때마다 아직 전송 중인 행을 다시 보내 같은 결제 요청이 여러 번 나간다.
+     */
+    static void requireSendTimeoutCoversDelivery(Duration sendTimeout, Map<String, Object> producerConfig) {
+        Object configured = producerConfig.get(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG);
+        if (configured == null) {
+            configured = ProducerConfig.configDef().defaultValues().get(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG);
+        }
+        long deliveryTimeoutMs = Long.parseLong(configured.toString());
+        if (sendTimeout.toMillis() <= deliveryTimeoutMs) {
+            throw new IllegalStateException("fms.payment-outbox.send-timeout(" + sendTimeout + ")은 프로듀서 "
+                    + ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG + "(" + deliveryTimeoutMs + "ms)보다 길어야 합니다. "
+                    + "짧으면 아직 전송 중인 결제 요청을 다시 보내 사본이 쌓입니다.");
+        }
     }
 
     @Override
